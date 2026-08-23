@@ -38,8 +38,8 @@ typedef struct {
     const double *timestamps;
 } h3_reference_presentation;
 
-/* Construct Ref2VA labels in exact request order, including pending audio
- * labels and per-block video timestamps, then run the Qwen decoder. */
+/* Construct Ref2VA labels in exact request order, including audio-only
+ * presentations and per-block video timestamps, then run the Qwen decoder. */
 int h3_multimodal_encode_ref2va_bf16(
                         const h3_tokenizer *tokenizer,
                         const char *weight_directory,
