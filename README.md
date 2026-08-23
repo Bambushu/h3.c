@@ -121,6 +121,13 @@ prompt with another seed avoids loading and encoding them again. Useful commands
 are `!status`, `!seed random`, `!seconds 2`, `!show`, `!save output.mp4`, and
 `!cache`. Use `!help` for the full, short list.
 
+The command-line executable serializes all H3 instances for the current user
+with a kernel-owned lock before Metal initialization. If another instance is
+active, the new instance reports the lock path while it waits. It also logs when
+the file lock is acquired and released. The lock is released by the kernel if
+the owner exits unexpectedly, so no stale PID-file cleanup is needed. This also
+applies to interactive sessions and keeps the lock until the session ends.
+
 First/last-frame conditioning is persistent in the session:
 
 ```text
