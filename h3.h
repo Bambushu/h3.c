@@ -66,6 +66,24 @@ typedef int (*h3_frame_callback)(const h3_frame *frame, void *opaque);
 typedef int (*h3_progress_callback)(const char *phase, int completed, int total,
                                     void *opaque);
 
+/* Integrator. Euler is the validated serving path; RES is the released
+ * second-order exponential multistep solver, retained for A/B comparison. */
+typedef enum {
+    H3_SAMPLER_EULER = 0,
+    H3_SAMPLER_RES = 1
+} h3_sampler;
+
+/* Noise schedule. LINEAR is the released shifted base grid; SIMPLE and BETA
+ * reproduce ComfyUI's simple_scheduler and beta_scheduler so the finetune
+ * presets can be matched. BETA57 is ComfyUI's beta_scheduler with
+ * alpha=0.5, beta=0.7 (the RES4LYF "beta57" scheduler). */
+typedef enum {
+    H3_SCHEDULER_LINEAR = 0,
+    H3_SCHEDULER_SIMPLE = 1,
+    H3_SCHEDULER_BETA = 2,
+    H3_SCHEDULER_BETA57 = 3
+} h3_scheduler;
+
 typedef struct {
     int width;
     int height;
@@ -130,12 +148,16 @@ typedef struct {
     h3_frame_callback on_frame;
     h3_progress_callback on_progress;
     void *callback_opaque;
+    /* Integrator and noise schedule; see h3_sampler / h3_scheduler. */
+    int sampler;
+    int scheduler;
 } h3_params;
 
 #define H3_PARAMS_DEFAULT { \
     H3_DEFAULT_WIDTH, H3_DEFAULT_HEIGHT, H3_DEFAULT_FRAMES, H3_DEFAULT_STEPS, \
     UINT64_C(42), NULL, NULL, NULL, NULL, 0, H3_REFERENCE_IMAGE_MATCH, \
-    1, H3_DEFAULT_DIT_LAYERS, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NULL, NULL, NULL \
+    1, H3_DEFAULT_DIT_LAYERS, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NULL, NULL, NULL, \
+    H3_SAMPLER_EULER, H3_SCHEDULER_LINEAR \
 }
 
 typedef struct {

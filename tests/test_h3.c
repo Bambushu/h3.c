@@ -82,6 +82,8 @@ static void test_schedule(void) {
     h3_params defaults = H3_PARAMS_DEFAULT;
     CHECK(defaults.steps == 20);
     CHECK(defaults.use_reference_rope == 0);
+    CHECK(defaults.sampler == H3_SAMPLER_EULER);
+    CHECK(defaults.scheduler == H3_SCHEDULER_LINEAR);
 
     h3_sigma_schedule schedule;
     CHECK(h3_schedule_build(20, &schedule));
@@ -96,6 +98,40 @@ static void test_schedule(void) {
         CHECK(schedule.video[index] > schedule.video[index + 1]);
         CHECK(schedule.audio[index] > schedule.audio[index + 1]);
     }
+
+    /* Selectable base schedules. simple is the released linear grid when the
+     * step count divides the 1000-point ComfyUI grid; beta and beta57 warp the
+     * same grid and must still be monotone and terminate at zero. */
+    h3_sigma_schedule linear, simple, beta, beta57;
+    CHECK(h3_serving_schedule_build_ex(8, H3_SCHEDULER_LINEAR, &linear));
+    CHECK(h3_serving_schedule_build_ex(8, H3_SCHEDULER_SIMPLE, &simple));
+    CHECK(h3_serving_schedule_build_ex(8, H3_SCHEDULER_BETA, &beta));
+    CHECK(h3_serving_schedule_build_ex(8, H3_SCHEDULER_BETA57, &beta57));
+    for (int index = 0; index <= 8; index++) {
+        CHECK(simple.video[index] == linear.video[index]);
+        CHECK(simple.audio[index] == linear.audio[index]);
+        CHECK(beta.video[index] >= beta57.video[index]);
+    }
+    for (int index = 0; index < 8; index++) {
+        CHECK(beta.video[index] > beta.video[index + 1]);
+        CHECK(beta57.video[index] > beta57.video[index + 1]);
+        CHECK(beta.audio[index] > beta.audio[index + 1]);
+        CHECK(beta57.audio[index] > beta57.audio[index + 1]);
+    }
+    CHECK(beta.video[8] == 0.0f && beta57.video[8] == 0.0f);
+    CHECK(beta.video[0] == 1.0f && beta57.video[0] == 1.0f);
+    /* Pinned against ComfyUI beta_scheduler(0.6,0.6) and the RES4LYF beta57
+     * registration beta_scheduler(0.5,0.7) at four steps. */
+    h3_sigma_schedule beta4, beta57_4;
+    CHECK(h3_serving_schedule_build_ex(4, H3_SCHEDULER_BETA, &beta4));
+    CHECK(h3_serving_schedule_build_ex(4, H3_SCHEDULER_BETA57, &beta57_4));
+    CHECK(close_enough(beta4.video[1], 0.9825119, 1e-6));
+    CHECK(close_enough(beta4.video[2], 0.9233605, 1e-6));
+    CHECK(close_enough(beta4.video[3], 0.7207329, 1e-6));
+    CHECK(close_enough(beta57_4.video[1], 0.9686099, 1e-6));
+    CHECK(close_enough(beta57_4.video[2], 0.8719390, 1e-6));
+    CHECK(close_enough(beta57_4.video[3], 0.5631350, 1e-6));
+    CHECK(!h3_serving_schedule_build_ex(4, 99, &beta4));
     double shifted = h3_time_shift_sigma(0.5, 12.0, 3.0);
     double back = h3_time_shift_sigma(shifted, 3.0, 12.0);
     CHECK(close_enough(back, 0.5, 1e-12));

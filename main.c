@@ -29,6 +29,8 @@ static void usage(const char *program) {
         "      --seconds N        Requested duration at 24 fps (instead of --frames)\n"
         "      --steps N          Denoising passes (default: 20)\n"
         "      --reuse N          Denoiser reuse: 1 close (default), 2 fast, 3 aggressive\n"
+        "      --sampler S        Integrator: euler (default) or res\n"
+        "      --scheduler S      Sigma grid: linear (default), simple, beta, beta57\n"
         "      --layers N         DiT blocks: 50 exact (default), 45 fast, 40 aggressive\n"
         "      --core-reuse N     Core refresh: 1 exact (default), 4 fast, 6 aggressive\n"
         "      --token-reduction  Pair video tokens in middle DiT blocks\n"
@@ -72,6 +74,25 @@ static int parse_int(const char *value, const char *label) {
         exit(2);
     }
     return (int)parsed;
+}
+
+static int parse_sampler(const char *value, const char *label) {
+    if (!strcmp(value, "euler")) return H3_SAMPLER_EULER;
+    if (!strcmp(value, "res")) return H3_SAMPLER_RES;
+    fprintf(stderr, "h3: invalid %s: %s (expected euler or res)\n",
+            label, value);
+    exit(2);
+}
+
+static int parse_scheduler(const char *value, const char *label) {
+    if (!strcmp(value, "linear")) return H3_SCHEDULER_LINEAR;
+    if (!strcmp(value, "simple")) return H3_SCHEDULER_SIMPLE;
+    if (!strcmp(value, "beta")) return H3_SCHEDULER_BETA;
+    if (!strcmp(value, "beta57")) return H3_SCHEDULER_BETA57;
+    fprintf(stderr,
+            "h3: invalid %s: %s (expected linear, simple, beta, or beta57)\n",
+            label, value);
+    exit(2);
 }
 
 static int frames_from_seconds(const char *value) {
@@ -235,6 +256,7 @@ int main(int argc, char **argv) {
 
     enum { OPT_WIDTH = 1000, OPT_HEIGHT, OPT_RENDER_WIDTH, OPT_RENDER_HEIGHT,
            OPT_FRAMES, OPT_SECONDS, OPT_STEPS, OPT_REUSE,
+           OPT_SAMPLER, OPT_SCHEDULER,
            OPT_LAYERS,
            OPT_CORE_REUSE,
            OPT_TOKEN_REDUCTION,
@@ -269,6 +291,8 @@ int main(int argc, char **argv) {
         {"seconds", required_argument, NULL, OPT_SECONDS},
         {"steps", required_argument, NULL, OPT_STEPS},
         {"reuse", required_argument, NULL, OPT_REUSE},
+        {"sampler", required_argument, NULL, OPT_SAMPLER},
+        {"scheduler", required_argument, NULL, OPT_SCHEDULER},
         {"layers", required_argument, NULL, OPT_LAYERS},
         {"core-reuse", required_argument, NULL, OPT_CORE_REUSE},
         {"token-reduction", no_argument, NULL, OPT_TOKEN_REDUCTION},
@@ -352,6 +376,12 @@ int main(int argc, char **argv) {
             case OPT_STEPS: params.steps = parse_int(optarg, "steps"); break;
             case OPT_REUSE:
                 params.denoise_reuse = parse_int(optarg, "reuse");
+                break;
+            case OPT_SAMPLER:
+                params.sampler = parse_sampler(optarg, "sampler");
+                break;
+            case OPT_SCHEDULER:
+                params.scheduler = parse_scheduler(optarg, "scheduler");
                 break;
             case OPT_LAYERS:
                 params.dit_layers = parse_int(optarg, "layers");

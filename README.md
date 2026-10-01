@@ -569,6 +569,15 @@ last pass. Whole-denoiser reuse evaluates the first and last pass plus every
 requested interval, then extrapolates skipped video and audio velocities on
 their independent schedules. With very small step counts, keep `--reuse 1`.
 
+`--sampler` selects the integrator: `euler` (default) or `res`, the released
+second-order exponential multistep solver. `--scheduler` selects the sigma
+grid: `linear` (default, the released shifted grid), `simple` (ComfyUI's
+`simple_scheduler`), `beta` (ComfyUI's `beta_scheduler` with alpha=0.6,
+beta=0.6), or `beta57` (the RES4LYF registration of `beta_scheduler` with
+alpha=0.5, beta=0.7). The ComfyUI-compatible grids exist so finetunes published
+with ComfyUI sampler presets can be matched. `res` is the reference solver and
+does not support `--reuse` or `--show`.
+
 For the low-budget path, the released linear base grid won against
 actual-video-sigma linear spacing,
 quadratic and cubic warps, exact 30-point tail subsets, mild power warps,

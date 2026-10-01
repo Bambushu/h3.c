@@ -157,6 +157,8 @@ static void print_help(void) {
     puts("  !seconds [N]             Set duration at 24 fps");
     puts("  !steps [N]               Set or show denoising steps");
     puts("  !reuse [N]               Set or show denoiser reuse");
+    puts("  !sampler [euler|res]     Set or show the integrator");
+    puts("  !scheduler [NAME]        Set or show linear|simple|beta|beta57");
     puts("  !layers [N]              Set or show active DiT blocks");
     puts("  !core-reuse [N]          Set or show core reuse");
     puts("  !token-reduction [on|off]  Toggle token reduction");
@@ -572,6 +574,33 @@ static int process_command(h3_cli_state *state, char *line, int *repeat) {
         set_integer(argument, "Steps", 1, H3_MAX_STEPS, &state->params.steps);
     } else if (!strcasecmp(command, "reuse")) {
         set_integer(argument, "Reuse", 1, 32, &state->params.denoise_reuse);
+    } else if (!strcasecmp(command, "sampler")) {
+        if (!*argument)
+            printf("Sampler: %s\n", state->params.sampler == H3_SAMPLER_RES ?
+                   "res" : "euler");
+        else if (!strcasecmp(argument, "euler"))
+            state->params.sampler = H3_SAMPLER_EULER;
+        else if (!strcasecmp(argument, "res"))
+            state->params.sampler = H3_SAMPLER_RES;
+        else
+            fprintf(stderr, "h3: sampler must be euler or res\n");
+    } else if (!strcasecmp(command, "scheduler")) {
+        static const char *names[] = {"linear", "simple", "beta", "beta57"};
+        if (!*argument) {
+            int index = state->params.scheduler;
+            printf("Scheduler: %s\n", index >= 0 && index < 4 ? names[index] :
+                   "unknown");
+        } else if (!strcasecmp(argument, "linear"))
+            state->params.scheduler = H3_SCHEDULER_LINEAR;
+        else if (!strcasecmp(argument, "simple"))
+            state->params.scheduler = H3_SCHEDULER_SIMPLE;
+        else if (!strcasecmp(argument, "beta"))
+            state->params.scheduler = H3_SCHEDULER_BETA;
+        else if (!strcasecmp(argument, "beta57"))
+            state->params.scheduler = H3_SCHEDULER_BETA57;
+        else
+            fprintf(stderr,
+                    "h3: scheduler must be linear, simple, beta, or beta57\n");
     } else if (!strcasecmp(command, "layers")) {
         set_integer(argument, "Layers", H3_MIN_DIT_LAYERS,
                     H3_DEFAULT_DIT_LAYERS, &state->params.dit_layers);

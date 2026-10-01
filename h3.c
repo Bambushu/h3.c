@@ -526,6 +526,22 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
         h3_set_error(ctx, "denoise reuse must be in [1, 3]");
         return 0;
     }
+    if (params->sampler != H3_SAMPLER_EULER &&
+        params->sampler != H3_SAMPLER_RES) {
+        h3_set_error(ctx, "sampler must be euler or res");
+        return 0;
+    }
+    if (params->scheduler < H3_SCHEDULER_LINEAR ||
+        params->scheduler > H3_SCHEDULER_BETA57) {
+        h3_set_error(ctx, "unknown noise scheduler");
+        return 0;
+    }
+    if (params->sampler == H3_SAMPLER_RES &&
+        (params->denoise_reuse != 1 || params->preview_denoise)) {
+        h3_set_error(ctx,
+            "the RES sampler does not support denoiser reuse or --show");
+        return 0;
+    }
     if (params->dit_layers < H3_MIN_DIT_LAYERS ||
         params->dit_layers > H3_DEFAULT_DIT_LAYERS) {
         h3_set_error(ctx, "DiT layers must be in [35, 50]");
@@ -1634,7 +1650,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         goto cleanup;
     }
     h3_sigma_schedule sigmas;
-    if (!h3_serving_schedule_build(params->steps, &sigmas)) {
+    if (!h3_serving_schedule_build_ex(params->steps, params->scheduler,
+                                      &sigmas)) {
         h3_set_error(ctx, "cannot construct the requested sigma schedule");
         goto cleanup;
     }
@@ -1796,12 +1813,19 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         prefetching = !pthread_create(&prefetch_thread, NULL,
                                       h3_vae_prefetch_run, &prefetch);
     }
-    int denoise_ok = h3_dit_denoise_euler_preview(
+    int denoise_ok;
+    if (params->sampler == H3_SAMPLER_RES) {
+        denoise_ok = h3_dit_denoise(dit, video, audio,
+                                    h3_dit_progress_bridge, &progress,
+                                    detail, sizeof(detail));
+    } else {
+        denoise_ok = h3_dit_denoise_euler_preview(
             dit, video, audio, params->denoise_reuse,
             h3_dit_progress_bridge, &progress,
             preview_decoder ? h3_deliver_denoise_preview : NULL,
             preview_decoder ? &live_preview : NULL,
             detail, sizeof(detail));
+    }
     double tail_started = h3_seconds();
     if (prefetching) {
         pthread_join(prefetch_thread, NULL);

@@ -164,6 +164,112 @@ int h3_serving_schedule_build(int evaluations, h3_sigma_schedule *schedule) {
     return 1;
 }
 
+static double h3_time_snr_shift(double shift, double base) {
+    if (shift == 1.0) return base;
+    return shift * base / (1.0 + (shift - 1.0) * base);
+}
+
+/* Regularized incomplete beta I_x(a,b) and its inverse. These exist only so
+ * the beta schedulers can reproduce ComfyUI's index selection, which is
+ * defined through scipy.stats.beta.ppf. */
+static double h3_beta_continued_fraction(double a, double b, double x) {
+    const int max_iterations = 300;
+    const double epsilon = 3e-16;
+    const double tiny = 1e-300;
+    double qab = a + b, qap = a + 1.0, qam = a - 1.0;
+    double c = 1.0;
+    double d = 1.0 - qab * x / qap;
+    if (fabs(d) < tiny) d = tiny;
+    d = 1.0 / d;
+    double h = d;
+    for (int m = 1; m <= max_iterations; m++) {
+        double m2 = 2.0 * m;
+        double aa = m * (b - m) * x / ((qam + m2) * (a + m2));
+        d = 1.0 + aa * d;
+        if (fabs(d) < tiny) d = tiny;
+        c = 1.0 + aa / c;
+        if (fabs(c) < tiny) c = tiny;
+        d = 1.0 / d;
+        h *= d * c;
+        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2));
+        d = 1.0 + aa * d;
+        if (fabs(d) < tiny) d = tiny;
+        c = 1.0 + aa / c;
+        if (fabs(c) < tiny) c = tiny;
+        d = 1.0 / d;
+        double delta = d * c;
+        h *= delta;
+        if (fabs(delta - 1.0) < epsilon) break;
+    }
+    return h;
+}
+
+static double h3_beta_inc(double a, double b, double x) {
+    if (x <= 0.0) return 0.0;
+    if (x >= 1.0) return 1.0;
+    double log_beta = lgamma(a) + lgamma(b) - lgamma(a + b);
+    double front = exp(a * log(x) + b * log1p(-x) - log_beta) / a;
+    if (x < (a + 1.0) / (a + b + 2.0))
+        return front * h3_beta_continued_fraction(a, b, x);
+    double back = exp(b * log1p(-x) + a * log(x) - log_beta) / b;
+    return 1.0 - back * h3_beta_continued_fraction(b, a, 1.0 - x);
+}
+
+static double h3_beta_ppf(double p, double a, double b) {
+    if (p <= 0.0) return 0.0;
+    if (p >= 1.0) return 1.0;
+    /* The distribution is symmetric about 1/2 when a == b. Bisection cannot
+     * resolve the exact midpoint tie, and the grid index it feeds is rounded,
+     * so return the identity directly. */
+    if (a == b && p == 0.5) return 0.5;
+    double low = 0.0, high = 1.0;
+    for (int index = 0; index < 128; index++) {
+        double mid = 0.5 * (low + high);
+        if (h3_beta_inc(a, b, mid) < p) low = mid;
+        else high = mid;
+    }
+    return 0.5 * (low + high);
+}
+
+int h3_serving_schedule_build_ex(int evaluations, int scheduler,
+                                 h3_sigma_schedule *schedule) {
+    if (scheduler == H3_SCHEDULER_LINEAR)
+        return h3_serving_schedule_build(evaluations, schedule);
+    if (!schedule || evaluations < 2 || evaluations > H3_MAX_STEPS ||
+        scheduler < H3_SCHEDULER_SIMPLE || scheduler > H3_SCHEDULER_BETA57)
+        return 0;
+    double alpha = scheduler == H3_SCHEDULER_BETA ? 0.6 : 0.5;
+    double beta = scheduler == H3_SCHEDULER_BETA ? 0.6 : 0.7;
+    memset(schedule, 0, sizeof(*schedule));
+    schedule->steps = evaluations;
+    for (int index = 0; index <= evaluations; index++) {
+        double base = 0.0;
+        if (index < evaluations) {
+            if (scheduler == H3_SCHEDULER_SIMPLE) {
+                /* ComfyUI simple_scheduler: every 1000/steps-th grid point. */
+                long step = (long)((double)index * 1000.0 /
+                                   (double)evaluations);
+                base = (double)(1000 - step) / 1000.0;
+                if (base < 0.0) base = 0.0;
+            } else {
+                /* ComfyUI beta_scheduler: beta-distributed grid index. */
+                double p = 1.0 - (double)index / (double)evaluations;
+                long grid = lround(h3_beta_ppf(p, alpha, beta) * 999.0);
+                if (grid < 0) grid = 0;
+                if (grid > 999) grid = 999;
+                base = (double)(grid + 1) / 1000.0;
+            }
+        }
+        schedule->video[index] = (float)h3_time_snr_shift(
+            H3_VIDEO_SIGMA_SHIFT, base);
+        schedule->audio[index] = (float)h3_time_snr_shift(
+            H3_AUDIO_SIGMA_SHIFT, base);
+    }
+    schedule->video[evaluations] = 0.0f;
+    schedule->audio[evaluations] = 0.0f;
+    return 1;
+}
+
 typedef struct {
     h3_layout *layout;
     size_t position_capacity;
