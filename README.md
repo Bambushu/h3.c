@@ -781,6 +781,14 @@ With `H3_PROFILE=1`, three lines report the timing:
 - `DiT load`: what remained on the main thread, split into phases. It prints
   in both modes.
 
+On an M5 Ultra at 768x1344, 107 frames, 20 steps with first and last frames,
+the main-thread DiT load fell from 11.7 s to 0.2 s with a warm cache and early
+load (3.1 s of loader-thread work hidden behind the encoders), and the whole
+job from 330.3 s to 318.2 s. Denoise time was unchanged. The first load per
+checkpoint wrote 18.3 GiB in 2.0 s and took 15.6 s instead of 11.7 s. Decoded
+RGB/PCM hashes matched the previous build for cold, verified, warm and early
+loads at 20 and 6 steps.
+
 ### Metal 4 and TensorOps paths
 
 M5 GPUs automatically use native BF16 Metal 4/TensorOps for the DiT QKV and
