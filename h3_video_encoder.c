@@ -65,7 +65,8 @@ typedef struct {
     int has_downsample;
 } encoder_level;
 
-/* Reused scratch for the single-frame Conv2d path, sized for one tile. */
+/* Reused scratch for the single-frame pipeline, sized for one tile and for
+ * Conv2d or Conv3d kernels. */
 typedef struct {
     h3_gpu_tensor *pixels;
     h3_gpu_tensor *state[2];
@@ -75,6 +76,7 @@ typedef struct {
     h3_gpu_tensor *shortcut;
     uint32_t height;
     uint32_t width;
+    int conv3d;
 } planar_arena;
 
 struct h3_video_encoder {
@@ -380,9 +382,26 @@ static size_t tensor_elements(uint32_t depth, uint32_t height, uint32_t width,
     return (size_t)depth * height * width * channels;
 }
 
-static int conv3d_requested(void) {
-    const char *value = getenv("H3_VAE_ENCODER_CONV3D");
+static int env_enabled(const char *name) {
+    const char *value = getenv(name);
     return value && *value && strcmp(value, "0");
+}
+
+/* Single-frame inputs use the arena pipeline with Conv2d by default, or the
+ * released Conv3d kernels in that pipeline (bit-identical to the released
+ * path). Multi-frame inputs and H3_DISABLE_VAE_ENCODER_ARENA use the released
+ * per-block allocation path. */
+typedef enum {
+    ENCODE_CONV2D,
+    ENCODE_CONV3D,
+    ENCODE_RELEASED
+} encode_mode;
+
+static encode_mode select_mode(int frames) {
+    if (frames != 1 || env_enabled("H3_DISABLE_VAE_ENCODER_ARENA"))
+        return ENCODE_RELEASED;
+    return env_enabled("H3_VAE_ENCODER_CONV3D") ? ENCODE_CONV3D :
+                                                  ENCODE_CONV2D;
 }
 
 static void normalize_pixels(const float *pixels, int frames, int height,
@@ -738,19 +757,21 @@ static int prepare_planar_weights(encoder_context *encoder, char *error,
     return 1;
 }
 
-static void planar_account(const encoder_conv *conv, uint32_t *height,
-                           uint32_t *width, size_t *activation,
-                           size_t *padded) {
+/* With Conv3d kernels the padded frame keeps its zero front frames. */
+static void planar_account(const encoder_conv *conv, int conv3d,
+                           uint32_t *height, uint32_t *width,
+                           size_t *activation, size_t *padded) {
     uint32_t padded_h, padded_w, output_h, output_w;
     planar_geometry(conv, *height, *width, &padded_h, &padded_w, &output_h,
                     &output_w);
+    uint32_t front = conv3d ? conv->depth_front : 0;
     size_t input = tensor_elements(1, *height, *width, conv->input_channels);
     size_t output = tensor_elements(1, output_h, output_w,
                                     conv->output_channels);
     if (input > *activation) *activation = input;
     if (output > *activation) *activation = output;
-    if (has_spatial_padding(conv)) {
-        size_t pad = tensor_elements(1, padded_h, padded_w,
+    if (front || has_spatial_padding(conv)) {
+        size_t pad = tensor_elements(1 + front, padded_h, padded_w,
                                      conv->input_channels);
         if (pad > *padded) *padded = pad;
     }
@@ -762,35 +783,36 @@ static void planar_account(const encoder_conv *conv, uint32_t *height,
  * reused by every block and tile; GPU ordering on the single queue makes the
  * reuse safe, and the CPU only rewrites pixels after the previous tile waited. */
 static int prepare_planar_arena(encoder_context *encoder, uint32_t height,
-                                uint32_t width, char *error,
+                                uint32_t width, int conv3d, char *error,
                                 size_t error_size) {
     planar_arena *arena = &encoder->arena;
-    if (arena->pixels && arena->height == height && arena->width == width)
+    if (arena->pixels && arena->height == height && arena->width == width &&
+        arena->conv3d == conv3d)
         return 1;
     planar_arena_free(arena);
     size_t activation = 0, padded = 0;
     uint32_t h = height, w = width;
-    planar_account(&encoder->conv_in, &h, &w, &activation, &padded);
+    planar_account(&encoder->conv_in, conv3d, &h, &w, &activation, &padded);
     for (int level = 0; level < LEVELS; level++) {
         for (int block = 0; block < BLOCKS; block++) {
             const encoder_block *item = &encoder->levels[level].blocks[block];
             uint32_t block_h = h, block_w = w;
-            planar_account(&item->conv1, &block_h, &block_w, &activation,
-                           &padded);
+            planar_account(&item->conv1, conv3d, &block_h, &block_w,
+                           &activation, &padded);
             block_h = h; block_w = w;
-            planar_account(&item->conv2, &block_h, &block_w, &activation,
-                           &padded);
+            planar_account(&item->conv2, conv3d, &block_h, &block_w,
+                           &activation, &padded);
             block_h = h; block_w = w;
             if (item->has_shortcut)
-                planar_account(&item->shortcut, &block_h, &block_w,
+                planar_account(&item->shortcut, conv3d, &block_h, &block_w,
                                &activation, &padded);
         }
         if (encoder->levels[level].has_downsample)
-            planar_account(&encoder->levels[level].downsample, &h, &w,
+            planar_account(&encoder->levels[level].downsample, conv3d, &h, &w,
                            &activation, &padded);
     }
-    planar_account(&encoder->conv_out, &h, &w, &activation, &padded);
-    planar_account(&encoder->quant, &h, &w, &activation, &padded);
+    planar_account(&encoder->conv_out, conv3d, &h, &w, &activation, &padded);
+    planar_account(&encoder->quant, conv3d, &h, &w, &activation, &padded);
     arena->pixels = h3_gpu_tensor_new_f32(
         encoder->gpu, tensor_elements(1, height, width, RGB_CHANNELS));
     arena->state[0] = h3_gpu_tensor_new_f32(encoder->gpu, activation);
@@ -807,9 +829,12 @@ static int prepare_planar_arena(encoder_context *encoder, uint32_t height,
     }
     arena->height = height;
     arena->width = width;
+    arena->conv3d = conv3d;
     return 1;
 }
 
+/* In Conv3d mode this reproduces the released conv exactly: the same causal
+ * padding kernel and the same cached Conv3d graph shape and weights. */
 static int planar_conv(encoder_context *encoder, h3_gpu_tensor *output,
                        const h3_gpu_tensor *input, const encoder_conv *conv,
                        uint32_t *height, uint32_t *width, char *error,
@@ -817,22 +842,31 @@ static int planar_conv(encoder_context *encoder, h3_gpu_tensor *output,
     uint32_t padded_h, padded_w, output_h, output_w;
     planar_geometry(conv, *height, *width, &padded_h, &padded_w, &output_h,
                     &output_w);
+    int conv3d = encoder->arena.conv3d;
+    uint32_t front = conv3d ? conv->depth_front : 0;
     const h3_gpu_tensor *source = input;
-    if (has_spatial_padding(conv)) {
+    if (front || has_spatial_padding(conv)) {
         if (!gpu_op(encoder, h3_gpu_vae_encoder_pad_f32(
                 encoder->gpu, encoder->arena.padded, input, 1, 1, *height,
-                *width, conv->input_channels, 0, conv->height_before,
+                *width, conv->input_channels, front, conv->height_before,
                 conv->height_after, conv->width_before, conv->width_after),
-                error, error_size, "visual encoder spatial padding")) return 0;
+                error, error_size, "visual encoder padding")) return 0;
         source = encoder->arena.padded;
     }
-    if (!gpu_op(encoder, h3_gpu_conv2d_f32(
+    int ok = conv3d ?
+        gpu_op(encoder, h3_gpu_conv3d_f32(
+            encoder->gpu, output, source, conv->weight, conv->bias, 1,
+            1 + front, padded_h, padded_w, conv->input_channels,
+            conv->output_channels, conv->kernel, conv->kernel, conv->kernel,
+            conv->stride_t, conv->stride_h, conv->stride_w), error, error_size,
+            "visual encoder Conv3d") :
+        gpu_op(encoder, h3_gpu_conv2d_f32(
             encoder->gpu, output, source,
             conv->planar_weight ? conv->planar_weight : conv->weight,
             conv->bias, 1, padded_h, padded_w, conv->input_channels,
             conv->output_channels, conv->kernel, conv->kernel, conv->stride_h,
-            conv->stride_w), error, error_size, "visual encoder Conv2d"))
-        return 0;
+            conv->stride_w), error, error_size, "visual encoder Conv2d");
+    if (!ok) return 0;
     *height = output_h;
     *width = output_w;
     return 1;
@@ -1172,11 +1206,13 @@ int h3_video_encoder_encode(h3_video_encoder *encoder, const float *pixels,
     }
     h3_gpu_stats start;
     ok = h3_gpu_get_stats(encoder->gpu, &start);
-    int planar = frames == 1 && !conv3d_requested();
-    if (ok && planar)
-        ok = prepare_planar_weights(encoder, error, error_size) &&
-             prepare_planar_arena(encoder, (uint32_t)y_axis.length,
-                                  (uint32_t)x_axis.length, error, error_size);
+    encode_mode mode = select_mode(frames);
+    if (ok && mode == ENCODE_CONV2D)
+        ok = prepare_planar_weights(encoder, error, error_size);
+    if (ok && mode != ENCODE_RELEASED)
+        ok = prepare_planar_arena(encoder, (uint32_t)y_axis.length,
+                                  (uint32_t)x_axis.length,
+                                  mode == ENCODE_CONV3D, error, error_size);
     int tile_count = y_axis.count * x_axis.count;
     float **tiles = ok ? calloc((size_t)tile_count, sizeof(*tiles)) : NULL;
     if (ok && !tiles) {
@@ -1190,7 +1226,7 @@ int h3_video_encoder_encode(h3_video_encoder *encoder, const float *pixels,
                 pixels, frames, height, width, y_axis.starts[y], x_axis.starts[x],
                 y_axis.length, x_axis.length, error, error_size);
             int current_time = 0;
-            if (tile) tiles[completed] = planar ?
+            if (tile) tiles[completed] = mode != ENCODE_RELEASED ?
                 encode_tile_planar(encoder, tile, y_axis.length, x_axis.length,
                                    &current_time, error, error_size) :
                 encode_tile(encoder, tile, frames, y_axis.length,
@@ -1204,8 +1240,10 @@ int h3_video_encoder_encode(h3_video_encoder *encoder, const float *pixels,
     if (ok) ok = stitch_latents(tiles, latent_time, &y_axis, &x_axis,
                                 output, error, error_size) &&
                  stats_since(encoder, &start, &output->gpu_stats);
-    h3_gpu_profile_mark(encoder->gpu, planar ? "encode Conv2d" :
-                                               "encode Conv3d");
+    static const char *const phases[] = {
+        "encode Conv2d", "encode Conv3d", "encode release"
+    };
+    h3_gpu_profile_mark(encoder->gpu, phases[mode]);
     if (tiles) for (int index = 0; index < tile_count; index++) free(tiles[index]);
     free(tiles);
     tile_axis_free(&y_axis);

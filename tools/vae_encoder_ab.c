@@ -5,12 +5,14 @@
  *
  * VAE_DIR is a checkpoint's FL2VA/video_vae/source directory. Images are
  * fitted exactly as h3 does (first frame stretched, last frame aspect-cover);
- * the default canvas is 768x1344. Each pass opens one encoder per path, the
- * released Conv3d path (H3_VAE_ENCODER_CONV3D=1) and then the default
- * single-frame Conv2d path, and encodes every image with it. The tool prints
- * per-path open/encode wall time and GPU counters, then the latent max abs and
- * relative L2 difference between the paths. With PASSES > 1 it also prints
- * the run-to-run difference of each path as a noise floor. */
+ * the default canvas is 768x1344. Each pass opens one encoder per path and
+ * encodes every image with it: "released" (H3_DISABLE_VAE_ENCODER_ARENA=1,
+ * per-block allocation and waits), "conv3d-arena" (H3_VAE_ENCODER_CONV3D=1,
+ * released kernels in the reused arena) and "conv2d" (the default). The open
+ * time is the per-context cost h3 used to pay once per anchor. The tool prints
+ * per-path open/encode wall time and GPU counters, then each path's latent max
+ * abs and relative L2 difference from "released". With PASSES > 1 it also
+ * prints the run-to-run difference of each path as a noise floor. */
 #include "h3_ffmpeg.h"
 #include "h3_video_encoder.h"
 
@@ -20,7 +22,7 @@
 #include <string.h>
 #include <time.h>
 
-enum { PATHS = 2, MAX_IMAGES = 2 };
+enum { PATHS = 3, MAX_IMAGES = 2 };
 
 static double now(void) {
     struct timespec ts;
@@ -89,15 +91,17 @@ int main(int argc, char **argv) {
             fprintf(stderr, "%s\n", error);
             return 1;
         }
-    static const char *names[PATHS] = {"conv3d", "conv2d"};
-    static const char *values[PATHS] = {"1", "0"};
+    static const char *names[PATHS] = {"released", "conv3d-arena", "conv2d"};
+    static const char *disable_arena[PATHS] = {"1", "0", "0"};
+    static const char *conv3d[PATHS] = {"1", "1", "0"};
     h3_video_latent first[PATHS][MAX_IMAGES];
     h3_video_latent latest[PATHS][MAX_IMAGES];
     memset(first, 0, sizeof(first));
     memset(latest, 0, sizeof(latest));
     for (int pass = 0; pass < passes; pass++)
         for (int path = 0; path < PATHS; path++) {
-            setenv("H3_VAE_ENCODER_CONV3D", values[path], 1);
+            setenv("H3_DISABLE_VAE_ENCODER_ARENA", disable_arena[path], 1);
+            setenv("H3_VAE_ENCODER_CONV3D", conv3d[path], 1);
             double start = now();
             h3_video_encoder *encoder = h3_video_encoder_open(
                 argv[1], "h3_shaders.metal", error, sizeof(error));
@@ -128,12 +132,15 @@ int main(int argc, char **argv) {
             h3_video_encoder_free(encoder);
             printf(", total %.3fs\n", now() - start);
         }
+    int last = passes > 1;
     for (int image = 0; image < image_count; image++) {
         char label[96];
-        int last = passes > 1;
-        snprintf(label, sizeof(label), "image %d conv2d vs conv3d", image + 1);
-        compare(label, last ? &latest[0][image] : &first[0][image],
-                last ? &latest[1][image] : &first[1][image]);
+        for (int path = 1; path < PATHS; path++) {
+            snprintf(label, sizeof(label), "image %d %s vs released",
+                     image + 1, names[path]);
+            compare(label, last ? &latest[0][image] : &first[0][image],
+                    last ? &latest[path][image] : &first[path][image]);
+        }
         if (!last) continue;
         for (int path = 0; path < PATHS; path++) {
             snprintf(label, sizeof(label), "image %d %s pass 1 vs pass %d",

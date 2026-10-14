@@ -30,8 +30,11 @@ h3_video_encoder *h3_video_encoder_open(const char *weight_directory,
                                         char *error, size_t error_size);
 /* Encode channel-major RGB [3,T,H,W] pixels in [0,1]. Spatial axes must be
  * multiples of 16. The released 256px/64px overlap tiling is preserved.
- * Single-frame inputs run every causal Conv3d as the equivalent Conv2d over
- * its last temporal tap unless H3_VAE_ENCODER_CONV3D=1. */
+ * Single-frame inputs run in a reused scratch arena with one wait per tile and
+ * execute every causal Conv3d as the equivalent Conv2d over its last temporal
+ * tap. H3_VAE_ENCODER_CONV3D=1 keeps the released Conv3d kernels in that
+ * pipeline (bit-identical to the released path); H3_DISABLE_VAE_ENCODER_ARENA=1
+ * restores the released per-block allocation path, as multi-frame inputs use. */
 int h3_video_encoder_encode(h3_video_encoder *encoder, const float *pixels,
                             int frames, int height, int width,
                             h3_video_encoder_progress progress,

@@ -681,18 +681,21 @@ encoder's causal 3x3x3 convs pad two zero frames in front of the input, so
 for a one-frame input only the last temporal kernel tap ever touches real data
 (this includes the time-strided downsample convs, whose output stays one frame
 deep). Single-frame encodes therefore run every conv as an F32 Conv2d over the
-reflect-padded frame using `weight[:, :, 2]`, sliced once per encoder, which
-drops the two-thirds of the multiply-adds that multiplied zeros and the 3x
-larger padded buffers. Each tile reuses one ping-pong scratch arena instead of
-allocating per block, chains its blocks with `h3_gpu_continue` and waits once,
-and both anchors share one Metal context, weight load and graph cache. The
-result is mathematically identical but not bit-identical, because MPSGraph may
-choose a different accumulation order for Conv2d; `H3_VAE_ENCODER_CONV3D=1`
-restores the released Conv3d path (per-block allocation and waits) for exact
-A/B diagnosis. Multi-frame reference videos always use the Conv3d path.
+reflect-padded frame using `weight[:, :, 2]`, sliced once per encoder. This
+removes the two-thirds of the multiply-adds that were against zeros, and the
+padded buffers become 3x smaller. Each tile reuses one ping-pong scratch arena
+instead of allocating per block, chains its blocks with `h3_gpu_continue` and
+waits once. Both anchors share one Metal context, weight load and graph cache.
+The Conv2d result is mathematically identical but not bit-identical, because
+MPSGraph may use a different accumulation order for Conv2d.
+`H3_VAE_ENCODER_CONV3D=1` keeps the released Conv3d kernels inside the arena
+pipeline: the same padding kernel and Conv3d graphs run on the same inputs, so
+only allocation and synchronization change.
+`H3_DISABLE_VAE_ENCODER_ARENA=1` restores the released per-block allocation and
+waits; multi-frame reference videos always use that path.
 `make h3_vae_encoder_bench` builds a tool that encodes real anchor images with
-both paths in one process and prints per-path timing and the latent max
-absolute and relative L2 difference.
+all three paths in one process. It prints per-path timing and each path's
+latent max absolute and relative L2 difference from the released path.
 
 ### Weight residency and streamed prompt encoding
 
