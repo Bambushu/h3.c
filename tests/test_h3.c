@@ -4,7 +4,9 @@
 #include "h3_metal.h"
 #include "h3_safetensors.h"
 #include "h3_terminal.h"
+#include "h3_ffmpeg.h"
 #include "h3_video_encoder.h"
+#include "h3_video_vae.h"
 
 #include <fcntl.h>
 #include <math.h>
@@ -763,6 +765,87 @@ static void test_video_encoder_single_frame_conv(void) {
     check_single_frame_conv(1, 1, 1, 0, 0);
 }
 
+static void test_video_vae_assembly(void) {
+    char error[256] = {0};
+    int ok = h3_video_vae_assembly_selftest(error, sizeof(error));
+    if (!ok) fprintf(stderr, "VAE assembly: %s\n", error);
+    CHECK(ok);
+}
+
+static void *read_file(const char *path, size_t *size) {
+    FILE *file = fopen(path, "rb");
+    if (!file) return NULL;
+    fseek(file, 0, SEEK_END);
+    long end = ftell(file);
+    fseek(file, 0, SEEK_SET);
+    void *data = end > 0 ? malloc((size_t)end) : NULL;
+    if (data && fread(data, 1, (size_t)end, file) != (size_t)end) {
+        free(data);
+        data = NULL;
+    }
+    fclose(file);
+    *size = data ? (size_t)end : 0;
+    return data;
+}
+
+/* Needs an FFmpeg with libx264; runs only when H3_FFMPEG names one. The
+ * streamed writer, fed in uneven runs with pauses, must produce the same
+ * file bytes as the whole-buffer writer, and abort must leave no file. */
+static void test_ffmpeg_stream(void) {
+    const char *ffmpeg = getenv("H3_FFMPEG");
+    if (!ffmpeg || !*ffmpeg) {
+        printf("skip: FFmpeg stream test (set H3_FFMPEG)\n");
+        return;
+    }
+    enum { FRAMES = 22, W = 64, H = 48, RATE = 32000, SAMPLES = RATE };
+    size_t frame_bytes = (size_t)W * H * 3;
+    uint8_t *frames = malloc(FRAMES * frame_bytes);
+    float *pcm = malloc(2 * SAMPLES * sizeof(*pcm));
+    CHECK(frames && pcm);
+    for (size_t index = 0; index < FRAMES * frame_bytes; index++)
+        frames[index] = (uint8_t)((index * 2654435761u) >> 24);
+    for (size_t index = 0; index < 2 * SAMPLES; index++)
+        pcm[index] = sinf((float)index * 0.01f) * 0.25f;
+    char directory[] = "/tmp/h3-ffmpeg-test-XXXXXX";
+    CHECK(mkdtemp(directory) != NULL);
+    char whole[256], streamed[256], aborted[256];
+    snprintf(whole, sizeof(whole), "%s/whole.mp4", directory);
+    snprintf(streamed, sizeof(streamed), "%s/streamed.mp4", directory);
+    snprintf(aborted, sizeof(aborted), "%s/aborted.mp4", directory);
+    char error[256];
+    CHECK(h3_ffmpeg_write_av_rgb24_f32(whole, frames, FRAMES, W, H, 24, pcm,
+                                       SAMPLES, 2, RATE, error,
+                                       sizeof(error)));
+    h3_ffmpeg_av_stream *stream = h3_ffmpeg_av_stream_open(
+        streamed, frames, FRAMES, W, H, 24, pcm, SAMPLES, 2, RATE, error,
+        sizeof(error));
+    CHECK(stream != NULL);
+    const int runs[] = {17, 17, 22};
+    for (size_t index = 0; index < sizeof(runs) / sizeof(*runs); index++) {
+        usleep(50000);
+        h3_ffmpeg_av_stream_ready(stream, runs[index]);
+    }
+    CHECK(h3_ffmpeg_av_stream_finish(stream, error, sizeof(error)));
+    size_t whole_size = 0, streamed_size = 0;
+    uint8_t *whole_bytes = read_file(whole, &whole_size);
+    uint8_t *streamed_bytes = read_file(streamed, &streamed_size);
+    CHECK(whole_bytes && streamed_bytes && whole_size == streamed_size);
+    CHECK(memcmp(whole_bytes, streamed_bytes, whole_size) == 0);
+    stream = h3_ffmpeg_av_stream_open(aborted, frames, FRAMES, W, H, 24, pcm,
+                                      SAMPLES, 2, RATE, error, sizeof(error));
+    CHECK(stream != NULL);
+    h3_ffmpeg_av_stream_ready(stream, 17);
+    h3_ffmpeg_av_stream_abort(stream);
+    CHECK(!exists(aborted));
+    unlink(whole);
+    unlink(streamed);
+    CHECK(rmdir(directory) == 0);   /* so no partial file was left behind */
+    free(whole_bytes);
+    free(streamed_bytes);
+    free(frames);
+    free(pcm);
+}
+
 int main(void) {
     test_temporal_and_canvas();
     test_schedule();
@@ -778,6 +861,8 @@ int main(void) {
     test_metal_probe();
     test_terminal_zoom();
     test_video_encoder_single_frame_conv();
+    test_video_vae_assembly();
+    test_ffmpeg_stream();
     printf("ok: %d checks\n", tests_run);
     return 0;
 }

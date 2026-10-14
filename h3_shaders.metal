@@ -491,6 +491,132 @@ kernel void h3_swiglu_f32(device const float *fused [[buffer(0)]],
     output[row * args.width + column] = gate / (1.0f + exp(-gate)) * up;
 }
 
+/* Fused epilogues of the low-precision video VAE block. Each repeats the
+ * per-element F32 arithmetic of the kernels it replaces (h3_bias_bf16_to_f32,
+ * h3_rms_norm_f32, h3_video_qkv_rope_f32, h3_swiglu_f32, h3_scale_add_f32,
+ * h3_cast_f32_to_bf16) in the same order; only the F32 intermediates that were
+ * stored and reloaded stay in registers, so the results are bit-identical. */
+kernel void h3_rms_norm_f32_to_bf16(device const float *input [[buffer(0)]],
+                                    device const float *weight [[buffer(1)]],
+                                    device ushort *output [[buffer(2)]],
+                                    constant norm_args &args [[buffer(3)]],
+                                    uint3 group [[threadgroup_position_in_grid]],
+                                    uint3 thread_position [[thread_position_in_threadgroup]],
+                                    uint3 threadgroup_size [[threads_per_threadgroup]]) {
+    uint row = group.x;
+    uint tid = thread_position.x;
+    uint threads = threadgroup_size.x;
+    if (row >= args.rows) return;
+    threadgroup float reductions[256];
+    device const float *x = input + row * args.width;
+    float local_sum = 0.0f;
+    for (uint k = tid; k < args.width; k += threads)
+        local_sum = fma(x[k], x[k], local_sum);
+    reductions[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = threads / 2; stride; stride >>= 1) {
+        if (tid < stride) reductions[tid] += reductions[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inverse = rsqrt(reductions[0] / float(args.width) + args.epsilon);
+    for (uint column = tid; column < args.width; column += threads) {
+        float normalized = x[column] * inverse * weight[column];
+        output[row * args.width + column] = h3_f32_to_bf16(normalized);
+    }
+}
+
+inline float h3_video_qkv_biased(device const ushort *qkv,
+                                 device const float *bias, uint row_base,
+                                 uint column) {
+    return h3_bf16_to_f32(qkv[row_base + column]) + bias[column];
+}
+
+kernel void h3_video_qkv_bias_rope_bf16(
+                            device const ushort *qkv [[buffer(0)]],
+                            device const float *bias [[buffer(1)]],
+                            device const float *rope_cos [[buffer(2)]],
+                            device const float *rope_sin [[buffer(3)]],
+                            device ushort *query [[buffer(4)]],
+                            device ushort *key [[buffer(5)]],
+                            device ushort *value [[buffer(6)]],
+                            constant qkv_args &args [[buffer(7)]],
+                            uint3 gid [[thread_position_in_grid]]) {
+    uint dimension = gid.x;
+    uint head = gid.y;
+    uint row = gid.z;
+    if (dimension >= args.head_dim || head >= args.heads || row >= args.sequence) return;
+    uint row_base = row * args.heads * args.head_dim * 3;
+    uint base = head * args.head_dim * 3;
+    float q_sum = 0.0f, k_sum = 0.0f;
+    for (uint d = 0; d < args.head_dim; d++) {
+        float q = h3_video_qkv_biased(qkv, bias, row_base, base + d);
+        float k = h3_video_qkv_biased(qkv, bias, row_base,
+                                      base + args.head_dim + d);
+        q_sum = fma(q, q, q_sum);
+        k_sum = fma(k, k, k_sum);
+    }
+    float qi = rsqrt(q_sum / float(args.head_dim) + args.epsilon);
+    float ki = rsqrt(k_sum / float(args.head_dim) + args.epsilon);
+    float q0 = h3_video_qkv_biased(qkv, bias, row_base, base + dimension) * qi;
+    float k0 = h3_video_qkv_biased(qkv, bias, row_base,
+                                   base + args.head_dim + dimension) * ki;
+    if (dimension < args.rope_half) {
+        uint pair = dimension + args.rope_half;
+        float q1 = h3_video_qkv_biased(qkv, bias, row_base, base + pair) * qi;
+        float k1 = h3_video_qkv_biased(qkv, bias, row_base,
+                                       base + args.head_dim + pair) * ki;
+        float c = rope_cos[row * args.rope_half + dimension];
+        float s = rope_sin[row * args.rope_half + dimension];
+        q0 = q0 * c - q1 * s;
+        k0 = k0 * c - k1 * s;
+    } else if (dimension < args.rope_half * 2) {
+        uint pair = dimension - args.rope_half;
+        float q1 = h3_video_qkv_biased(qkv, bias, row_base, base + pair) * qi;
+        float k1 = h3_video_qkv_biased(qkv, bias, row_base,
+                                       base + args.head_dim + pair) * ki;
+        float c = rope_cos[row * args.rope_half + pair];
+        float s = rope_sin[row * args.rope_half + pair];
+        q0 = q0 * c + q1 * s;
+        k0 = k0 * c + k1 * s;
+    }
+    uint output_index = (row * args.heads + head) * args.head_dim + dimension;
+    query[output_index] = h3_f32_to_bf16(q0);
+    key[output_index] = h3_f32_to_bf16(k0);
+    value[output_index] = h3_f32_to_bf16(h3_video_qkv_biased(
+        qkv, bias, row_base, base + args.head_dim * 2 + dimension));
+}
+
+kernel void h3_bias_swiglu_bf16(device const ushort *fused [[buffer(0)]],
+                                device const float *bias [[buffer(1)]],
+                                device ushort *output [[buffer(2)]],
+                                constant swiglu_args &args [[buffer(3)]],
+                                uint2 gid [[thread_position_in_grid]]) {
+    uint column = gid.x;
+    uint row = gid.y;
+    if (row >= args.rows || column >= args.width) return;
+    uint base = row * args.width * 2;
+    float gate = h3_bf16_to_f32(fused[base + column]) + bias[column];
+    float up = h3_bf16_to_f32(fused[base + args.width + column]) +
+               bias[args.width + column];
+    float activated = gate / (1.0f + exp(-gate)) * up;
+    output[row * args.width + column] = h3_f32_to_bf16(activated);
+}
+
+kernel void h3_bias_scale_add_bf16(device const float *residual [[buffer(0)]],
+                                   device const ushort *branch [[buffer(1)]],
+                                   device const float *bias [[buffer(2)]],
+                                   device const float *scale [[buffer(3)]],
+                                   device float *output [[buffer(4)]],
+                                   constant swiglu_args &args [[buffer(5)]],
+                                   uint2 gid [[thread_position_in_grid]]) {
+    uint column = gid.x;
+    uint row = gid.y;
+    if (row >= args.rows || column >= args.width) return;
+    uint index = row * args.width + column;
+    float widened = h3_bf16_to_f32(branch[index]) + bias[column];
+    output[index] = residual[index] + widened * scale[column];
+}
+
 struct vae_encoder_pad_args {
     uint batch;
     uint depth;

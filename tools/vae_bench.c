@@ -2,10 +2,16 @@
  *
  *   vae_bench <video_vae/source dir> <latent.bin> [out.rgbf32] [ref.rgbf32]
  *
- * Prints load/decode wall time; with a reference it prints max abs error and
- * PSNR over the [0,1] RGB output, so precision variants (H3_VAE_PRECISION)
- * can be compared against the released F32 path on identical input. */
+ * Prints load/decode wall time and SHA-256 of the decoded F32 RGB and of the
+ * RGB24 bytes H3 encodes, so decode paths (H3_VAE_DECODE_LEGACY=1,
+ * H3_VAE_UNFUSED=1) can be checked for bit-identical output; with a reference
+ * it prints max abs error and PSNR over the [0,1] RGB output, so precision
+ * variants (H3_VAE_PRECISION) can be compared against the released F32 path
+ * on identical input. VAE_BENCH_REPEAT=N decodes N times (the first decode
+ * also builds pipelines and graphs) and checks every repeat matches. */
 #include "h3_video_vae.h"
+
+#include <CommonCrypto/CommonDigest.h>
 
 #include <math.h>
 #include <stdint.h>
@@ -36,6 +42,35 @@ static void *read_all(const char *path, size_t *size) {
     return data;
 }
 
+static void sha256_hex(const void *data, size_t bytes, char hex[65]) {
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256_CTX context;
+    CC_SHA256_Init(&context);
+    const unsigned char *cursor = data;
+    while (bytes) {
+        CC_LONG part = bytes > 0x40000000u ? 0x40000000u : (CC_LONG)bytes;
+        CC_SHA256_Update(&context, cursor, part);
+        cursor += part;
+        bytes -= part;
+    }
+    CC_SHA256_Final(digest, &context);
+    for (int index = 0; index < CC_SHA256_DIGEST_LENGTH; index++)
+        snprintf(hex + 2 * index, 3, "%02x", digest[index]);
+}
+
+/* h3.c's F32 -> RGB24 conversion. */
+static uint8_t *to_rgb24(const float *rgb, size_t count) {
+    uint8_t *output = malloc(count);
+    if (!output) return NULL;
+    for (size_t index = 0; index < count; index++) {
+        float scaled = rgb[index] * 255.0f;
+        if (scaled < 0.0f) scaled = 0.0f;
+        if (scaled > 255.0f) scaled = 255.0f;
+        output[index] = (uint8_t)lrintf(scaled);
+    }
+    return output;
+}
+
 int main(int argc, char **argv) {
     if (argc < 3) {
         fprintf(stderr, "usage: %s VAE_DIR LATENT [OUT] [REF]\n", argv[0]);
@@ -63,18 +98,46 @@ int main(int argc, char **argv) {
         return 1;
     }
     double loaded = now();
+    const char *repeat_value = getenv("VAE_BENCH_REPEAT");
+    int repeats = repeat_value ? atoi(repeat_value) : 1;
+    if (repeats < 1) repeats = 1;
+    printf("mode %s%s precision %s\n",
+           h3_video_vae_pipelined() ? "pipelined" : "legacy",
+           getenv("H3_VAE_UNFUSED") ? " (unfused)" : "",
+           getenv("H3_VAE_PRECISION") ? getenv("H3_VAE_PRECISION") : "f32");
     h3_video_frames frames = {0};
-    if (!h3_video_vae_decoder_decode(decoder, latent, t, &frames, error,
-                                     sizeof(error))) {
-        fprintf(stderr, "decode: %s\n", error);
-        return 1;
+    char first_hash[65] = {0};
+    size_t values = 0;
+    for (int run = 0; run < repeats; run++) {
+        if (run) h3_video_frames_free(&frames);
+        double started = now();
+        if (!h3_video_vae_decoder_decode(decoder, latent, t, &frames, error,
+                                         sizeof(error))) {
+            fprintf(stderr, "decode: %s\n", error);
+            return 1;
+        }
+        double decoded = now();
+        values = (size_t)frames.frames * (size_t)frames.height *
+                 (size_t)frames.width * 3;
+        char f32_hash[65], rgb24_hash[65];
+        sha256_hex(frames.rgb, values * sizeof(float), f32_hash);
+        uint8_t *rgb24 = to_rgb24(frames.rgb, values);
+        if (!rgb24) {
+            fprintf(stderr, "out of memory\n");
+            return 1;
+        }
+        sha256_hex(rgb24, values, rgb24_hash);
+        free(rgb24);
+        printf("latent %dx%dx%d -> %d frames %dx%d  load %.2fs  decode %.2fs\n",
+               t, h, w, frames.frames, frames.width, frames.height,
+               loaded - start, decoded - started);
+        printf("sha256 rgbf32 %s  rgb24 %s\n", f32_hash, rgb24_hash);
+        if (!run) memcpy(first_hash, f32_hash, sizeof(first_hash));
+        else if (strcmp(first_hash, f32_hash)) {
+            fprintf(stderr, "repeat %d decoded different output\n", run + 1);
+            return 1;
+        }
     }
-    double decoded = now();
-    size_t values = (size_t)frames.frames * (size_t)frames.height *
-                    (size_t)frames.width * 3;
-    printf("latent %dx%dx%d -> %d frames %dx%d  load %.2fs  decode %.2fs\n",
-           t, h, w, frames.frames, frames.width, frames.height,
-           loaded - start, decoded - loaded);
     if (argc > 3 && argv[3][0] && strcmp(argv[3], "-") != 0) {
         FILE *out = fopen(argv[3], "wb");
         if (!out || fwrite(frames.rgb, sizeof(float), values, out) != values) {

@@ -105,6 +105,10 @@ int h3_gpu_begin(h3_gpu *gpu);
  * the same ordered queue. h3_gpu_submit() waits and validates the whole chain. */
 int h3_gpu_continue(h3_gpu *gpu);
 int h3_gpu_submit(h3_gpu *gpu);
+/* Wait for the oldest buffer committed by h3_gpu_continue() and retire it from
+ * the chain, leaving the newer ones running. Because the queue is ordered, its
+ * outputs are then final while the GPU works on the later buffers. */
+int h3_gpu_wait_oldest(h3_gpu *gpu);
 const char *h3_gpu_error(const h3_gpu *gpu);
 int h3_gpu_get_stats(const h3_gpu *gpu, h3_gpu_stats *stats);
 /* Optional benchmark labels. With H3_PROFILE set, marks and context teardown
@@ -211,6 +215,39 @@ int h3_gpu_video_qkv_rope_f32(h3_gpu *gpu, h3_gpu_tensor *query,
                               uint32_t sequence, uint32_t heads,
                               uint32_t head_dim, uint32_t rope_half,
                               float epsilon);
+/* Fused epilogues of the low-precision video VAE block. Each one performs the
+ * per-element arithmetic of the separate kernels it replaces (BF16 widening,
+ * F32 bias, norm/RoPE/SwiGLU/residual, BF16 rounding) in the same order, so the
+ * results are bit-identical; only the F32 round trips through memory go. */
+/* output_bf16 = BF16(RMSNorm_f32(input) * weight), as rms_norm_f32 + cast. */
+int h3_gpu_rms_norm_f32_to_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                                const h3_gpu_tensor *input,
+                                const h3_gpu_tensor *weight, uint32_t rows,
+                                uint32_t width, float epsilon);
+/* As bias_bf16_to_f32 over the fused [rows, 3 * heads * head_dim] QKV, then
+ * video_qkv_rope_f32, then a BF16 cast of query, key and value. */
+int h3_gpu_video_qkv_bias_rope_bf16(h3_gpu *gpu, h3_gpu_tensor *query,
+                                    h3_gpu_tensor *key, h3_gpu_tensor *value,
+                                    const h3_gpu_tensor *qkv,
+                                    const h3_gpu_tensor *bias,
+                                    const h3_gpu_tensor *rope_cos,
+                                    const h3_gpu_tensor *rope_sin,
+                                    uint32_t sequence, uint32_t heads,
+                                    uint32_t head_dim, uint32_t rope_half,
+                                    float epsilon);
+/* As bias_bf16_to_f32 over [rows, 2 * width], swiglu_f32 and a BF16 cast. */
+int h3_gpu_bias_swiglu_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                            const h3_gpu_tensor *fused,
+                            const h3_gpu_tensor *bias, uint32_t rows,
+                            uint32_t width);
+/* As bias_bf16_to_f32 then scale_add_f32: output = residual + (F32(branch) +
+ * bias) * scale. output may alias residual. */
+int h3_gpu_bias_scale_add_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                               const h3_gpu_tensor *residual,
+                               const h3_gpu_tensor *branch,
+                               const h3_gpu_tensor *bias,
+                               const h3_gpu_tensor *scale, uint32_t rows,
+                               uint32_t width);
 
 /* H3 AudioVAE uses time-major [batch,length,channels] activations and stores
  * Conv1d/ConvTranspose1d weights in PyTorch OIK/IOK order respectively. */

@@ -674,7 +674,32 @@ weight fingerprint) so later runs skip reading and casting the F32 weights,
 and `H3_VAE_PREFETCH=1` loads the decoder on a second thread during the
 denoise; both leave the output bit-identical. `H3_DUMP_VIDEO_LATENT=<file>`
 saves the final latent, and `make vae_bench` builds a tool that replays just
-the VAE decode from it for timing and PSNR comparisons.
+the VAE decode from it for timing, PSNR comparisons and SHA-256 output hashes
+(`VAE_BENCH_REPEAT=N` decodes N times and checks the repeats agree).
+
+The resident decoder (the prefetched or cached one) runs the tail after the
+denoise as a pipeline. Tile N+1 is committed to the GPU before the host
+waits for tile N, which it then unpacks and stitches into the current chunk
+while N+1 runs; two input and two output slots alternate, and one zero suffix
+token serves every tile instead of per-tile allocations. As each temporal
+chunk is blended its 17 final frames are converted to RGB24 and fed to an
+FFmpeg started before the decode (into a hidden partial file renamed on
+success), so H.264 encoding overlaps the remaining tiles; the single-use DiT
+is torn down on a second thread meanwhile. With BF16 or int8 precision and
+BF16 attention, each block's BF16<->F32 epilogues are fused (the norms write
+BF16 matmul inputs, bias+QK-norm+RoPE+cast and bias+SwiGLU+cast run as one
+kernel each, and the output/MLP biases fold into the residual updates). Every
+value goes through the same arithmetic in the same order, the FFmpeg command
+and the frame bytes it reads are unchanged, so decoded frames, PCM and the
+file bytes are bit-identical; only memory traffic, dispatches, waits and
+serialization change. `H3_VAE_DECODE_LEGACY=1` restores the released path
+(blocking submit per tile, unfused epilogues, whole-video conversion then
+FFmpeg, inline DiT free) and `H3_VAE_UNFUSED=1` keeps the pipeline but
+unfuses the epilogues. With `H3_PROFILE` the tail prints an
+`output tail` line (prefetch join, DiT free, latent dump, audio VAE, decoder
+acquisition, FFmpeg start, video decode, RGB24 conversion, FFmpeg finish), a
+`video VAE decode` line (GPU wait, encode, input staging, unpack, stitch,
+blend and sink time) and one line per delivered chunk.
 
 Single-image anchors (first/last frame) are encoded in a reused ping-pong
 scratch arena instead of allocating per block; each tile chains its blocks
