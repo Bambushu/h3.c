@@ -676,6 +676,24 @@ denoise; both leave the output bit-identical. `H3_DUMP_VIDEO_LATENT=<file>`
 saves the final latent, and `make vae_bench` builds a tool that replays just
 the VAE decode from it for timing and PSNR comparisons.
 
+First/last-frame anchors are single images, and the released visual VAE
+encoder's causal 3x3x3 convs pad two zero frames in front of the input, so
+for a one-frame input only the last temporal kernel tap ever touches real data
+(this includes the time-strided downsample convs, whose output stays one frame
+deep). Single-frame encodes therefore run every conv as an F32 Conv2d over the
+reflect-padded frame using `weight[:, :, 2]`, sliced once per encoder, which
+drops the two-thirds of the multiply-adds that multiplied zeros and the 3x
+larger padded buffers. Each tile reuses one ping-pong scratch arena instead of
+allocating per block, chains its blocks with `h3_gpu_continue` and waits once,
+and both anchors share one Metal context, weight load and graph cache. The
+result is mathematically identical but not bit-identical, because MPSGraph may
+choose a different accumulation order for Conv2d; `H3_VAE_ENCODER_CONV3D=1`
+restores the released Conv3d path (per-block allocation and waits) for exact
+A/B diagnosis. Multi-frame reference videos always use the Conv3d path.
+`make h3_vae_encoder_bench` builds a tool that encodes real anchor images with
+both paths in one process and prints per-path timing and the latent max
+absolute and relative L2 difference.
+
 ### Weight residency and streamed prompt encoding
 
 On M5-class GPUs, persistent transformer weights are mapped directly from their
