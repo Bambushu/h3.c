@@ -699,7 +699,15 @@ unfuses the epilogues. With `H3_PROFILE` the tail prints an
 `output tail` line (prefetch join, DiT free, latent dump, audio VAE, decoder
 acquisition, FFmpeg start, video decode, RGB24 conversion, FFmpeg finish), a
 `video VAE decode` line (GPU wait, encode, input staging, unpack, stitch,
-blend and sink time) and one line per delivered chunk.
+blend and sink time, plus the command buffers used) and one line per
+delivered chunk. MPSGraph commits its command buffer itself as it encodes
+(`mps-commits`), so a tile spans several command buffers and two queued tiles
+can exceed the Metal queue's default limit of 64 uncompleted buffers. The
+pipelined encoder then blocks creating the next buffer until the GPU retires
+one, which the line reports as `encode` (`mps-encode`, `queue-create`) while
+the GPU is still busy with the queued work. `H3_GPU_QUEUE_DEPTH=<n>` raises the
+limit for every Metal context; it only changes when the host blocks, not what
+the GPU runs.
 
 Single-image anchors (first/last frame) are encoded in a reused ping-pong
 scratch arena instead of allocating per block; each tile chains its blocks

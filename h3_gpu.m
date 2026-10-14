@@ -172,6 +172,22 @@ static double h3_gpu_now(void) {
     return (double)time.tv_sec + (double)time.tv_nsec * 1e-9;
 }
 
+/* After an MPSGraph encode: MPSGraph may have called commitAndContinue on the
+ * MPS command buffer, committing the root buffer (with everything encoded
+ * before it) and opening a new one, so the context continues on the current
+ * root. Count those commits and the wall spent inside MPS encodes, which
+ * includes any time -[MTLCommandQueue commandBuffer] blocked at the queue's
+ * uncompleted-buffer limit. */
+static void h3_gpu_adopt_mps_root(H3GPU *gpu, MPSCommandBuffer *command,
+                                  double started) {
+    id<MTLCommandBuffer> root = command.rootCommandBuffer;
+    h3_gpu_stats stats = gpu.stats;
+    if (root != gpu.command) stats.mps_commits++;
+    stats.mps_encode_seconds += h3_gpu_now() - started;
+    gpu.stats = stats;
+    gpu.command = root;
+}
+
 static int h3_gpu_profile_enabled(void) {
     const char *value = getenv("H3_PROFILE");
     return value && *value && strcmp(value, "0");
@@ -343,7 +359,16 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
         gpu.profileStartWall = h3_gpu_now();
         gpu.profileMarkWall = gpu.profileStartWall;
         gpu.device = MTLCreateSystemDefaultDevice();
-        gpu.queue = [gpu.device newCommandQueue];
+        /* H3_GPU_QUEUE_DEPTH=<n> raises the queue's uncompleted command
+         * buffer limit (Metal's default is 64); when it is reached, creating
+         * a command buffer blocks until the GPU completes one. Scheduling
+         * only: the same buffers run in the same order. */
+        const char *depth_value = getenv("H3_GPU_QUEUE_DEPTH");
+        long depth = depth_value ? strtol(depth_value, NULL, 10) : 0;
+        gpu.queue = depth >= 1 && depth <= 4096 ?
+            [gpu.device newCommandQueueWithMaxCommandBufferCount:
+                (NSUInteger)depth] :
+            [gpu.device newCommandQueue];
         gpu.reuseMPSCommandDefault = YES;
         gpu.inflightCommands = [NSMutableArray array];
         gpu.sdpaCache = [NSMutableDictionary dictionary];
@@ -841,7 +866,11 @@ int h3_gpu_continue(h3_gpu *opaque) {
         stats.submissions++;
         stats.command_encode_seconds += commit_time - gpu.commandStartWall;
         gpu.stats = stats;
+        double create_started = h3_gpu_now();
         gpu.command = [gpu.queue commandBuffer];
+        stats = gpu.stats;
+        stats.command_create_seconds += h3_gpu_now() - create_started;
+        gpu.stats = stats;
     }
     if (!gpu.command) {
         h3_gpu_set_error(gpu, @"cannot continue Metal command chain");
@@ -1617,6 +1646,7 @@ static int h3_gpu_sdpa(h3_gpu *opaque, h3_gpu_tensor *output,
     if (!cache) return 0;
     @autoreleasepool {
         MPSCommandBuffer *command = h3_gpu_mps_command(gpu);
+        double mps_started = h3_gpu_now();
         MPSGraphTensorData *(^data)(const h3_gpu_tensor *) =
             ^MPSGraphTensorData *(const h3_gpu_tensor *tensor) {
                 return h3_gpu_graph_data(tensor, cache.inputShape,
@@ -1635,7 +1665,7 @@ static int h3_gpu_sdpa(h3_gpu *opaque, h3_gpu_tensor *output,
             h3_gpu_set_error(gpu, @"MPSGraph SDPA failed: %@", exception.reason);
             return 0;
         }
-        gpu.command = command.rootCommandBuffer;
+        h3_gpu_adopt_mps_root(gpu, command, mps_started);
     }
     h3_gpu_stats stats = gpu.stats;
     stats.mps_sdpa_dispatches++;
@@ -1984,6 +2014,7 @@ static int h3_gpu_conv_mps(H3GPU *gpu, h3_gpu_tensor *output,
     if (!conv) return 0;
     @autoreleasepool {
         MPSCommandBuffer *command = h3_gpu_mps_command(gpu);
+        double mps_started = h3_gpu_now();
         MPSGraphTensorData *input_data = [[MPSGraphTensorData alloc]
             initWithMTLBuffer:TENSOR(input).buffer shape:conv.inputShape
             dataType:MPSDataTypeFloat32];
@@ -2011,7 +2042,7 @@ static int h3_gpu_conv_mps(H3GPU *gpu, h3_gpu_tensor *output,
                              exception.reason);
             return 0;
         }
-        gpu.command = command.rootCommandBuffer;
+        h3_gpu_adopt_mps_root(gpu, command, mps_started);
     }
     h3_gpu_stats stats = gpu.stats;
     stats.mps_conv_dispatches++;
@@ -2082,6 +2113,7 @@ static int h3_gpu_encode_conv(H3GPU *gpu, H3Conv *conv,
                               const h3_gpu_tensor *bias, NSString *label) {
     @autoreleasepool {
         MPSCommandBuffer *command = h3_gpu_mps_command(gpu);
+        double mps_started = h3_gpu_now();
         MPSGraphTensorData *input_data = [[MPSGraphTensorData alloc]
             initWithMTLBuffer:TENSOR(input).buffer shape:conv.inputShape
             dataType:MPSDataTypeFloat32];
@@ -2109,7 +2141,7 @@ static int h3_gpu_encode_conv(H3GPU *gpu, H3Conv *conv,
                              exception.reason);
             return 0;
         }
-        gpu.command = command.rootCommandBuffer;
+        h3_gpu_adopt_mps_root(gpu, command, mps_started);
     }
     h3_gpu_stats stats = gpu.stats;
     stats.mps_conv_dispatches++;
@@ -2691,6 +2723,7 @@ static int h3_gpu_linear_mps(H3GPU *gpu, h3_gpu_tensor *output,
     if (!linear) return 0;
     @autoreleasepool {
         MPSCommandBuffer *command = h3_gpu_mps_command(gpu);
+        double mps_started = h3_gpu_now();
         MPSGraphTensorData *input_data = h3_gpu_graph_data(
             input, linear.inputShape, dataType, 0);
         MPSGraphTensorData *weight_data = h3_gpu_graph_data(
@@ -2713,7 +2746,7 @@ static int h3_gpu_linear_mps(H3GPU *gpu, h3_gpu_tensor *output,
             h3_gpu_set_error(gpu, @"MPSGraph linear failed: %@", exception.reason);
             return 0;
         }
-        gpu.command = command.rootCommandBuffer;
+        h3_gpu_adopt_mps_root(gpu, command, mps_started);
     }
     h3_gpu_stats stats = gpu.stats;
     stats.mps_linear_dispatches++;
@@ -2910,6 +2943,7 @@ int h3_gpu_mlp_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
     if (!mlp) return 0;
     @autoreleasepool {
         MPSCommandBuffer *command = h3_gpu_mps_command(gpu);
+        double mps_started = h3_gpu_now();
         MPSGraphTensorData *inputData = h3_gpu_graph_data(
             input, mlp.inputShape, MPSDataTypeBFloat16, 0);
         MPSGraphTensorData *fc1Data = h3_gpu_graph_data(
@@ -2930,7 +2964,7 @@ int h3_gpu_mlp_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
             h3_gpu_set_error(gpu, @"MPSGraph MLP failed: %@", exception.reason);
             return 0;
         }
-        gpu.command = command.rootCommandBuffer;
+        h3_gpu_adopt_mps_root(gpu, command, mps_started);
     }
     h3_gpu_stats stats = gpu.stats;
     stats.mps_linear_dispatches += 2;
@@ -4527,6 +4561,7 @@ static int h3_gpu_gqa_mps(H3GPU *gpu, h3_gpu_tensor *output,
     }
     @autoreleasepool {
         MPSCommandBuffer *command = h3_gpu_mps_command(gpu);
+        double mps_started = h3_gpu_now();
         MPSGraphTensorData *query_data = [[MPSGraphTensorData alloc]
             initWithMTLBuffer:TENSOR(query).buffer shape:cache.queryShape
             dataType:MPSDataTypeBFloat16];
@@ -4552,7 +4587,7 @@ static int h3_gpu_gqa_mps(H3GPU *gpu, h3_gpu_tensor *output,
                              exception.reason);
             return 0;
         }
-        gpu.command = command.rootCommandBuffer;
+        h3_gpu_adopt_mps_root(gpu, command, mps_started);
     }
     h3_gpu_stats stats = gpu.stats;
     stats.mps_sdpa_dispatches++;

@@ -30,6 +30,13 @@ typedef struct {
     /* Root MTLCommandBuffer timestamps; MPSGraph may schedule child buffers,
      * so command_wait_seconds is the complete turnaround measurement. */
     double gpu_seconds;
+    /* Root buffers MPSGraph committed itself (commitAndContinue), the wall
+     * spent inside MPSGraph encodes and inside h3_gpu_continue's new command
+     * buffer; the last two include blocking at the queue's uncompleted
+     * command buffer limit (see H3_GPU_QUEUE_DEPTH). */
+    uint64_t mps_commits;
+    double mps_encode_seconds;
+    double command_create_seconds;
 } h3_gpu_stats;
 
 h3_gpu *h3_gpu_create(const char *shader_source_path,

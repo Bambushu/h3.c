@@ -1655,14 +1655,20 @@ static int decoder_decode_legacy(h3_video_vae_decoder *decoder,
     free(temporal_overlap);
     if (!ok) h3_video_frames_free(output);
     if (ok && env_enabled("H3_PROFILE")) {
+        const h3_gpu_stats *after = &output->gpu_stats;
         double wall = vae_seconds() - started;
-        double wait = output->gpu_stats.command_wait_seconds -
+        double wait = after->command_wait_seconds -
                       before.command_wait_seconds;
         fprintf(stderr, "h3 profile: video VAE decode legacy fused=%d "
                 "tiles=%d chunks=%d wall=%.3fs gpu-wait=%.3fs "
-                "host+encode=%.3fs\n", decoder->vae.fused,
+                "host+encode=%.3fs cmdbufs=%llu (mps-commits=%llu) "
+                "mps-encode=%.3fs\n", decoder->vae.fused,
                 decoder->y_axis.count * decoder->x_axis.count, chunks,
-                wall, wait, wall - wait);
+                wall, wait, wall - wait,
+                (unsigned long long)(after->submissions - before.submissions +
+                                     after->mps_commits - before.mps_commits),
+                (unsigned long long)(after->mps_commits - before.mps_commits),
+                after->mps_encode_seconds - before.mps_encode_seconds);
     }
     return ok;
 }
@@ -1804,12 +1810,21 @@ static int decoder_decode_pipelined(h3_video_vae_decoder *decoder,
     if (ok && assembler.profile) {
         h3_gpu_stats after = before;
         h3_gpu_get_stats(vae->gpu, &after);
+        /* encode includes time blocked creating command buffers once the
+         * queue holds its limit of uncompleted ones (mps-encode and
+         * queue-create); the GPU keeps working through that time. */
         fprintf(stderr, "h3 profile: video VAE decode pipelined fused=%d "
-                "tiles=%d chunks=%d wall=%.3fs gpu-wait=%.3fs root-gpu=%.3fs "
-                "encode=%.3fs input=%.3fs unpack=%.3fs stitch=%.3fs "
-                "blend=%.3fs sink=%.3fs\n", vae->fused, tile_count, chunks,
-                vae_seconds() - started, wait_seconds,
-                after.gpu_seconds - before.gpu_seconds, encode_seconds,
+                "tiles=%d chunks=%d wall=%.3fs gpu-wait=%.3fs "
+                "encode=%.3fs (mps-encode=%.3fs queue-create=%.3fs) "
+                "cmdbufs=%llu (mps-commits=%llu) input=%.3fs unpack=%.3fs "
+                "stitch=%.3fs blend=%.3fs sink=%.3fs\n", vae->fused,
+                tile_count, chunks, vae_seconds() - started, wait_seconds,
+                encode_seconds,
+                after.mps_encode_seconds - before.mps_encode_seconds,
+                after.command_create_seconds - before.command_create_seconds,
+                (unsigned long long)(after.submissions - before.submissions +
+                                     after.mps_commits - before.mps_commits),
+                (unsigned long long)(after.mps_commits - before.mps_commits),
                 input_seconds, assembler.unpack_seconds,
                 assembler.stitch_seconds, assembler.blend_seconds,
                 assembler.sink_seconds);
