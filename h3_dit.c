@@ -1364,6 +1364,13 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
         !getenv("H3_DISABLE_FUSED_PATCH_CAST") && !getenv("H3_SCALAR_PATCH");
     dit->fused_patch_pack = dit->fused_patch_projection &&
         !getenv("H3_DISABLE_FUSED_PATCH_PACK");
+    /* Int8 QKV writes the three head-major tensors directly. Without a
+     * BF16 fallback or token-reduction bypass, this arena only backs the
+     * attention heads (INNER) and normalized MLP input (HIDDEN). */
+    size_t qkv_width = INNER * 3;
+    if (dit->activation_aliases && dit->int8_qkv &&
+        !dit->keep_bf16_qkv && !dit->token_reduction)
+        qkv_width = INNER;
 #define BF(field, elements) (dit->field = h3_gpu_tensor_new_bf16(dit->gpu, (elements)))
 #define F32(field, elements) (dit->field = h3_gpu_tensor_new_f32(dit->gpu, (elements)))
     h3_gpu_tensor *all[] = {
@@ -1371,7 +1378,7 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
         F32(audio_input, audio_total * AUDIO_CHANNELS),
         BF(hidden, sequence * HIDDEN),
         BF(mod_attention, sequence * HIDDEN),
-        BF(qkv, sequence * INNER * 3),
+        BF(qkv, sequence * qkv_width),
         BF(query, sequence * INNER),
         BF(key, sequence * INNER),
         BF(value, sequence * INNER),

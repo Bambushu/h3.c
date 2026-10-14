@@ -429,6 +429,41 @@ uncompressed media file is created.
 The remainder documents the implementation behind the tutorial presets and the
 environment variables retained for exact A/B diagnosis.
 
+### Local on-demand pipeline deployment — 2026-10-14
+
+The installed binary includes the measured on-demand Metal pipeline implementation
+from [upstream PR #75](https://github.com/antirez/h3.c/pull/75), while preserving the
+parser and compact-QKV fixes. Direct pipelines are compiled on first use and cached
+within their GPU context; shader-library compilation and arithmetic are unchanged.
+
+One real Studio API draft job produced 56 frames at 864×480 / 24 fps with stereo
+32 kHz audio, seed 17. Complete software decoding, gallery publication and advancing
+browser playback passed. Studio was not restarted, and no generation settings,
+weights, shaders, image runtime or service configuration changed. This serving smoke
+does not establish an API-latency improvement. The public URL remains Access protected;
+verification exercised the actual local backend.
+
+Source, binary, build/API/media/browser receipts and exact rollback files are under
+`../runtimes/lazy-pipelines-20261014/`. For rollback, wait for idle and atomically
+restore that directory's `rollback/h3` to `h3.c/h3`, then restore its `h3_gpu.m` and
+`README.md`. Subsequent workers use the restored binary without a service restart.
+
+### Local parser allocation deployment — 2026-10-14
+
+The installed binary includes [upstream PR #74](https://github.com/antirez/h3.c/pull/74):
+JSON string buffers are sized from the encoded string, rather than the remaining
+safetensors header. The previously installed compact-QKV optimization is preserved.
+The parser change reduces retained tensor-name capacity, not total model memory;
+no generation speedup is claimed.
+
+A real Studio API draft job produced a 56-frame 864×480 clip with stereo audio.
+Complete software decoding, gallery publication and browser playback passed.
+Studio was not restarted; profiles, weights, image runtime and service configuration
+were unchanged. The versioned binary, source, verification and provenance are under
+`../runtimes/parser-allocation-20261014/`. For rollback, wait for idle and atomically
+restore that directory's `rollback/h3` to `h3.c/h3`, then restore the backed-up
+`h3_safetensors.c` and `README.md`. Subsequent workers use the restored binary.
+
 ### Sampler and DiT controls
 
 The default sampler uses the released shifted video/audio schedule. `--steps`
@@ -628,6 +663,36 @@ MLP input, while the current attention-output arena becomes the MLP output after
 its branch has been consumed. This removes 61.25 MiB at 512-class geometry and
 99.63 MiB at 864-class geometry without changing dispatches or arithmetic.
 `H3_DISABLE_DIT_ACTIVATION_ALIAS=1` restores separate diagnostic buffers.
+
+On the int8-only QKV path, that shared arena needs only `sequence * 7168`
+BF16 elements, not the packed projection's `sequence * 21504`: int8 QKV writes
+query, key and value directly into their separate head-major tensors. The
+normalized MLP input also fits in the smaller arena. BF16 QKV, retained-BF16
+diagnostics, token reduction and alias-disabled diagnostics keep the original
+capacity. Dispatches, arithmetic, quantization and sampling settings are unchanged.
+
+Local M5 Ultra validation (macOS 27, 2026-10-08) used complete 56-frame clips:
+
+| Profile | DiT tracked peak tensor storage, before → after |
+| --- | --- |
+| 864×480, 8 steps, 50 blocks, reuse 1 | 19.170 → 18.980 GiB |
+| 1344×768, 20 steps, 50 blocks, reuse 2 | 20.940 → 20.476 GiB |
+
+These counters describe H3 tensor allocations, not total process/driver memory.
+No generation-speed improvement is claimed: warm draft runs remained around
+38 seconds and the standard pair measured 120.46/120.79 seconds. Complete video
+and audio decoding passed, including the BF16-QKV fallback. With one prepared
+real-weight model and fixed inputs, three full-versus-compact arena comparisons
+per resolution produced byte-identical video/audio velocities through all 50
+blocks. Independent full generations were not byte-reproducible even with the
+unmodified binary; these checks do not establish end-to-end pixel identity or
+a general visual-quality guarantee.
+
+The same investigation rejected per-block quantization-submission batching,
+wider FC2 tiles, deeper Qwen prefetch, forced cached quantization and copied
+transformer weights as speed defaults. The initial cold-versus-warm difference
+was not attributed to an optimization.
+
 MPSGraph tensor-data wrappers for immutable DiT weights and biases are retained
 with their resident buffers. This avoids rebuilding the same binding metadata
 for every block and denoiser evaluation without copying tensor storage; measured
