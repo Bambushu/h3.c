@@ -1383,9 +1383,10 @@ int h3_gpu_qkv_rope_f32(h3_gpu *opaque, h3_gpu_tensor *query,
 
 
 /* MPSGraph native SDPA silently corrupts output on M2/M3 Ultra above ~15k
- * query rows (antirez/h3.c#16 / Apple FB24605554). Split non-causal queries
- * into blocks. Defaults: split when sequence > 12288, block size 2048.
- * H3_SDPA_MAX_QUERY_ROWS=0 disables splitting. */
+ * query rows (antirez/h3.c#16 / Apple FB24605554). When enabled, split
+ * non-causal queries longer than H3_SDPA_SPLIT_MIN_ROWS (default 12288) into
+ * blocks of H3_SDPA_MAX_QUERY_ROWS rows (e.g. 2048). Off by default: the split
+ * is slower and uses more memory, and corruption on M5 Ultra is unconfirmed. */
 static unsigned h3_gpu_env_u32(const char *name, unsigned fallback) {
     const char *text = getenv(name);
     if (!text || !*text) return fallback;
@@ -1397,8 +1398,8 @@ static unsigned h3_gpu_env_u32(const char *name, unsigned fallback) {
 }
 
 static unsigned h3_gpu_sdpa_query_block(void) {
-    /* 0 disables query splitting. */
-    return h3_gpu_env_u32("H3_SDPA_MAX_QUERY_ROWS", 2048u);
+    /* 0 (default) disables query splitting. */
+    return h3_gpu_env_u32("H3_SDPA_MAX_QUERY_ROWS", 0u);
 }
 
 static unsigned h3_gpu_sdpa_split_min_rows(void) {
