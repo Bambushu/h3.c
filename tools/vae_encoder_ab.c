@@ -7,8 +7,8 @@
  * fitted exactly as h3 does (first frame stretched, last frame aspect-cover);
  * the default canvas is 768x1344. Each pass opens one encoder per path and
  * encodes every image with it: "released" (H3_DISABLE_VAE_ENCODER_ARENA=1,
- * per-block allocation and waits), "conv3d-arena" (H3_VAE_ENCODER_CONV3D=1,
- * released kernels in the reused arena) and "conv2d" (the default). The open
+ * per-block allocation and waits), "conv3d-arena" (the default, released
+ * kernels in the reused arena) and "conv2d" (H3_VAE_ENCODER_CONV2D=1). The open
  * time is the per-context cost h3 used to pay once per anchor. The tool prints
  * per-path open/encode wall time and GPU counters, then each path's latent max
  * abs and relative L2 difference from "released". With PASSES > 1 it also
@@ -93,7 +93,7 @@ int main(int argc, char **argv) {
         }
     static const char *names[PATHS] = {"released", "conv3d-arena", "conv2d"};
     static const char *disable_arena[PATHS] = {"1", "0", "0"};
-    static const char *conv3d[PATHS] = {"1", "1", "0"};
+    static const char *conv2d[PATHS] = {"0", "0", "1"};
     h3_video_latent first[PATHS][MAX_IMAGES];
     h3_video_latent latest[PATHS][MAX_IMAGES];
     memset(first, 0, sizeof(first));
@@ -101,7 +101,7 @@ int main(int argc, char **argv) {
     for (int pass = 0; pass < passes; pass++)
         for (int path = 0; path < PATHS; path++) {
             setenv("H3_DISABLE_VAE_ENCODER_ARENA", disable_arena[path], 1);
-            setenv("H3_VAE_ENCODER_CONV3D", conv3d[path], 1);
+            setenv("H3_VAE_ENCODER_CONV2D", conv2d[path], 1);
             double start = now();
             h3_video_encoder *encoder = h3_video_encoder_open(
                 argv[1], "h3_shaders.metal", error, sizeof(error));

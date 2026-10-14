@@ -387,9 +387,10 @@ static int env_enabled(const char *name) {
     return value && *value && strcmp(value, "0");
 }
 
-/* Single-frame inputs use the arena pipeline with Conv2d by default, or the
- * released Conv3d kernels in that pipeline (bit-identical to the released
- * path). Multi-frame inputs and H3_DISABLE_VAE_ENCODER_ARENA use the released
+/* Single-frame inputs use the arena pipeline with the released Conv3d kernels
+ * by default (bit-identical to the released path), or Conv2d over the last
+ * temporal tap with H3_VAE_ENCODER_CONV2D=1 (faster, not bit-identical).
+ * Multi-frame inputs and H3_DISABLE_VAE_ENCODER_ARENA use the released
  * per-block allocation path. */
 typedef enum {
     ENCODE_CONV2D,
@@ -400,8 +401,8 @@ typedef enum {
 static encode_mode select_mode(int frames) {
     if (frames != 1 || env_enabled("H3_DISABLE_VAE_ENCODER_ARENA"))
         return ENCODE_RELEASED;
-    return env_enabled("H3_VAE_ENCODER_CONV3D") ? ENCODE_CONV3D :
-                                                  ENCODE_CONV2D;
+    return env_enabled("H3_VAE_ENCODER_CONV2D") ? ENCODE_CONV2D :
+                                                  ENCODE_CONV3D;
 }
 
 static void normalize_pixels(const float *pixels, int frames, int height,
