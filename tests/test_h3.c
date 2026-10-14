@@ -4,6 +4,7 @@
 #include "h3_metal.h"
 #include "h3_safetensors.h"
 #include "h3_terminal.h"
+#include "h3_video_encoder.h"
 
 #include <fcntl.h>
 #include <math.h>
@@ -669,6 +670,99 @@ static void test_terminal_zoom(void) {
     CHECK(!h3_terminal_display_dimensions(INT32_MAX, 1, &width, &height));
 }
 
+static int reflect_index(int coordinate, int length) {
+    if (coordinate < 0) return -coordinate;
+    if (coordinate >= length) return 2 * length - coordinate - 2;
+    return coordinate;
+}
+
+static float synthetic_value(uint32_t index, uint32_t salt) {
+    uint32_t state = index * 2654435761u + salt * 40503u + 12345u;
+    state ^= state >> 13;
+    return (float)((int)(state % 2001u) - 1000) / 337.0f;
+}
+
+/* A one-frame causal Conv3d (kernel-1 zero front frames, reflect spatial
+ * padding, any temporal stride) must equal the Conv2d over its last temporal
+ * tap exactly: the dropped taps only ever multiply the zero front frames. */
+static void check_single_frame_conv(uint32_t kernel, uint32_t stride_t,
+                                    uint32_t stride, uint32_t pad_before,
+                                    uint32_t pad_after) {
+    enum { IN = 3, OUT = 4, H = 6, W = 7 };
+    uint32_t front = kernel - 1;
+    uint32_t padded_d = 1 + front;
+    uint32_t padded_h = H + pad_before + pad_after;
+    uint32_t padded_w = W + pad_before + pad_after;
+    CHECK((padded_d - kernel) / stride_t + 1 == 1);
+    uint32_t out_h = (padded_h - kernel) / stride + 1;
+    uint32_t out_w = (padded_w - kernel) / stride + 1;
+    size_t taps = (size_t)kernel * kernel * kernel;
+    float *input = malloc((size_t)H * W * IN * sizeof(*input));
+    float *weight = malloc((size_t)OUT * IN * taps * sizeof(*weight));
+    float *planar = malloc((size_t)OUT * IN * kernel * kernel *
+                           sizeof(*planar));
+    float *volume = calloc((size_t)padded_d * padded_h * padded_w * IN,
+                           sizeof(*volume));
+    float bias[OUT];
+    CHECK(input && weight && planar && volume);
+    for (uint32_t index = 0; index < (uint32_t)(H * W * IN); index++)
+        input[index] = synthetic_value(index, 1);
+    for (uint32_t index = 0; index < (uint32_t)(OUT * IN * taps); index++)
+        weight[index] = synthetic_value(index, 2);
+    for (uint32_t index = 0; index < OUT; index++)
+        bias[index] = synthetic_value(index, 3);
+    h3_video_encoder_slice_tap_f32(weight, OUT, IN, kernel, kernel - 1, planar);
+    for (uint32_t pair = 0; pair < OUT * IN; pair++)
+        for (uint32_t tap = 0; tap < kernel * kernel; tap++)
+            CHECK(planar[pair * kernel * kernel + tap] ==
+                  weight[(pair * kernel + kernel - 1) * kernel * kernel + tap]);
+    /* The real frame follows `front` zero frames, as h3_vae_encoder_pad_f32. */
+    for (uint32_t y = 0; y < padded_h; y++)
+        for (uint32_t x = 0; x < padded_w; x++)
+            for (uint32_t channel = 0; channel < IN; channel++) {
+                int source_y = reflect_index((int)y - (int)pad_before, H);
+                int source_x = reflect_index((int)x - (int)pad_before, W);
+                volume[(((size_t)front * padded_h + y) * padded_w + x) * IN +
+                       channel] =
+                    input[((size_t)source_y * W + (size_t)source_x) * IN +
+                          channel];
+            }
+    const float *plane = volume + (size_t)front * padded_h * padded_w * IN;
+    for (uint32_t y = 0; y < out_h; y++)
+        for (uint32_t x = 0; x < out_w; x++)
+            for (uint32_t output = 0; output < OUT; output++) {
+                float full = bias[output], sliced = bias[output];
+                for (uint32_t kd = 0; kd < kernel; kd++)
+                    for (uint32_t kh = 0; kh < kernel; kh++)
+                        for (uint32_t kw = 0; kw < kernel; kw++)
+                            for (uint32_t channel = 0; channel < IN; channel++)
+                                full += volume[(((size_t)kd * padded_h +
+                                    y * stride + kh) * padded_w +
+                                    x * stride + kw) * IN + channel] *
+                                    weight[((((size_t)output * IN + channel) *
+                                    kernel + kd) * kernel + kh) * kernel + kw];
+                for (uint32_t kh = 0; kh < kernel; kh++)
+                    for (uint32_t kw = 0; kw < kernel; kw++)
+                        for (uint32_t channel = 0; channel < IN; channel++)
+                            sliced += plane[(((size_t)y * stride + kh) *
+                                padded_w + x * stride + kw) * IN + channel] *
+                                planar[(((size_t)output * IN + channel) *
+                                kernel + kh) * kernel + kw];
+                CHECK(full == sliced);
+            }
+    free(input);
+    free(weight);
+    free(planar);
+    free(volume);
+}
+
+static void test_video_encoder_single_frame_conv(void) {
+    check_single_frame_conv(3, 1, 1, 1, 1);
+    check_single_frame_conv(3, 2, 2, 0, 1);
+    check_single_frame_conv(3, 1, 2, 0, 1);
+    check_single_frame_conv(1, 1, 1, 0, 0);
+}
+
 int main(void) {
     test_temporal_and_canvas();
     test_schedule();
@@ -683,6 +777,7 @@ int main(void) {
     test_dit_row_conversions();
     test_metal_probe();
     test_terminal_zoom();
+    test_video_encoder_single_frame_conv();
     printf("ok: %d checks\n", tests_run);
     return 0;
 }

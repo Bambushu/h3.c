@@ -31,6 +31,10 @@ libh3.a: $(LIB_OBJ)
 vae_bench: tools/vae_bench.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
+# Diagnostic: A/B the single-frame visual VAE encoder paths on real anchors.
+h3_vae_encoder_bench: tools/vae_encoder_ab.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
 tools/%.o: tools/%.c
 	$(CC) $(CFLAGS) -I. -c $< -o $@
 
@@ -218,5 +222,5 @@ clean:
 		h3_real_multimodal_text_test h3_real_ref_video_text_test \
 		h3_real_dit_schedule_test h3_real_dit_test h3_semantic_dit_test \
 		h3_real_video_vae_test h3_semantic_vae_test \
-	h3_dit_bench h3_dit_bench_864 vae_bench \
+	h3_dit_bench h3_dit_bench_864 vae_bench h3_vae_encoder_bench \
 	libh3.a *.o *.d tests/*.o tests/*.d tools/*.o tools/*.d

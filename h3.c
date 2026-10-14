@@ -969,6 +969,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     int keyframes[2] = {0, 0};
     size_t keyframe_count = 0;
     float *condition_video_rows = NULL;
+    h3_video_encoder *video_encoder = NULL;
     size_t condition_video_elements = 0;
     float *condition_audio_rows = NULL;
     size_t condition_audio_elements = 0;
@@ -1387,6 +1388,13 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             h3_set_error(ctx, "out of memory allocating visual condition rows");
             goto cleanup;
         }
+        /* One Metal context, weight load and graph set for every anchor. */
+        video_encoder = h3_video_encoder_open(vae_path, "h3_shaders.metal",
+                                              detail, sizeof(detail));
+        if (!video_encoder) {
+            h3_set_error(ctx, "%s", detail);
+            goto cleanup;
+        }
         size_t condition_offset = 0;
         for (size_t image = 0; image < visual_count; image++) {
             int image_latent_w, image_latent_h;
@@ -1399,8 +1407,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
                                   (size_t)image_latent_w / 4 * 96;
             h3_video_latent latent;
             memset(&latent, 0, sizeof(latent));
-            if (!h3_video_vae_encode(
-                    vae_path, "h3_shaders.metal", condition_pixels[image],
+            if (!h3_video_encoder_encode(
+                    video_encoder, condition_pixels[image],
                     condition_frames[image], condition_heights[image],
                     condition_widths[image],
                     h3_video_encoder_progress_bridge, &progress,
@@ -1430,6 +1438,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             condition_offset += row_elements;
             if (progress.cancelled) goto cleanup;
         }
+        h3_video_encoder_free(video_encoder);
+        video_encoder = NULL;
         if (condition_offset != condition_video_elements) {
             h3_set_error(ctx, "visual condition packing size mismatch");
             goto cleanup;
@@ -1905,6 +1915,7 @@ cleanup:
     free(presentation_timestamps);
     free(layout_references);
     free(condition_video_rows);
+    h3_video_encoder_free(video_encoder);
     free(condition_audio_rows);
     h3_text_embedding_free(&text);
     h3_layout_free(&layout);
