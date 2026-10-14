@@ -38,6 +38,10 @@ void h3_gpu_free(h3_gpu *gpu);
 int h3_gpu_is_m5(const h3_gpu *gpu);
 int h3_gpu_has_nax_mlp(const h3_gpu *gpu);
 int h3_gpu_has_int8_mlp(const h3_gpu *gpu);
+/* Describe everything about this context that selects kernel code: device
+ * name and the TensorOps compile/mode choice. Persistent caches of
+ * GPU-derived weights key on it. */
+int h3_gpu_describe(const h3_gpu *gpu, char *buffer, size_t size);
 
 h3_gpu_tensor *h3_gpu_tensor_new_f32(h3_gpu *gpu, size_t elements);
 h3_gpu_tensor *h3_gpu_tensor_new_bf16(h3_gpu *gpu, size_t elements);
@@ -53,6 +57,12 @@ h3_gpu_tensor *h3_gpu_tensor_load_bf16(h3_gpu *gpu, const char *path,
                                        uint64_t file_offset, size_t elements);
 h3_gpu_tensor *h3_gpu_tensor_load_f32(h3_gpu *gpu, const char *path,
                                       uint64_t file_offset, size_t elements);
+/* Load a payload from a derived-weight cache file (H3_DIT_CACHE) with the same
+ * policy as transformer weights: zero-copy file mapping on M5, a copied buffer
+ * otherwise or with H3_ZERO_COPY_WEIGHTS=0. */
+h3_gpu_tensor *h3_gpu_tensor_load_cache(h3_gpu *gpu, const char *path,
+                                        uint64_t file_offset, size_t elements,
+                                        h3_gpu_dtype dtype);
 /* Fill an existing shared BF16 buffer from a file. The tensor and its
  * accounting are unchanged, so this may run on an I/O thread while another
  * tensor is in flight on the GPU. */
@@ -68,6 +78,10 @@ int h3_gpu_tensor_stream_file_bf16(h3_gpu_tensor *tensor, const char *path,
 void h3_gpu_tensor_free(h3_gpu_tensor *tensor);
 size_t h3_gpu_tensor_elements(const h3_gpu_tensor *tensor);
 h3_gpu_dtype h3_gpu_tensor_dtype(const h3_gpu_tensor *tensor);
+size_t h3_gpu_tensor_bytes(const h3_gpu_tensor *tensor);
+/* Host view of shared storage, valid once the producing command buffer has
+ * completed (h3_gpu_submit). */
+const void *h3_gpu_tensor_contents(const h3_gpu_tensor *tensor);
 int h3_gpu_tensor_read_f32(const h3_gpu_tensor *tensor, float *values,
                            size_t elements);
 int h3_gpu_tensor_read_f32_range(const h3_gpu_tensor *tensor,
@@ -141,6 +155,11 @@ int h3_gpu_copy_f32(h3_gpu *gpu, h3_gpu_tensor *destination,
                     size_t destination_offset,
                     const h3_gpu_tensor *source, size_t source_offset,
                     size_t elements);
+/* Reference each tensor from a 4-byte blit so this command buffer makes the
+ * whole allocation GPU-resident. Zero-copy file mappings are then faulted in
+ * and wired during a load rather than by the first forward. Reads only. */
+int h3_gpu_make_resident(h3_gpu *gpu, h3_gpu_tensor *const *tensors,
+                         size_t count);
 int h3_gpu_rms_norm_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                         const h3_gpu_tensor *input,
                         const h3_gpu_tensor *weight, uint32_t rows,

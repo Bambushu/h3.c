@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 
 static char h3_global_error[512];
 
@@ -740,6 +741,59 @@ static void *h3_vae_prefetch_run(void *opaque) {
     return NULL;
 }
 
+/* H3_DIT_EARLY_LOAD=1: load the prompt-independent DiT half (its Metal
+ * context, the AdaLN schedule and the persistent block weights) on a second
+ * thread while the anchors and prompt are encoded. The DiT load adopts it only
+ * for exactly the request it was prepared for; on any failure or mismatch the
+ * serial load below runs as before. */
+typedef struct {
+    const char *weight_directory;
+    h3_sigma_schedule sigmas;
+    unsigned active_blocks;
+    int visual_condition;
+    int audio_condition;
+    int ssd_streaming;
+    int use_slower_bf16_mlp;
+    int use_slower_bf16_qkv;
+    int use_slower_bf16_attention_output;
+    h3_dit_core *core;
+    char error[512];
+} h3_dit_early_load;
+
+static void *h3_dit_early_load_run(void *opaque) {
+    h3_dit_early_load *job = opaque;
+    job->core = h3_dit_core_load(
+        job->weight_directory, "h3_shaders.metal", &job->sigmas,
+        job->active_blocks, job->visual_condition, job->audio_condition,
+        job->ssd_streaming, job->use_slower_bf16_mlp,
+        job->use_slower_bf16_qkv, job->use_slower_bf16_attention_output,
+        job->error, sizeof(job->error));
+    return NULL;
+}
+
+/* Whether the packed layout will carry visual and audio condition rows. A
+ * wrong guess only costs the early load: the DiT load then runs serially. */
+static void h3_predict_conditions(const h3_params *params, int ref2va,
+                                  int *visual, int *audio) {
+    *visual = !ref2va && (params->first_frame || params->last_frame);
+    *audio = 0;
+    for (size_t index = 0; ref2va && index < params->reference_count;
+         index++) {
+        const h3_reference *reference = &params->references[index];
+        if (reference->kind != H3_REFERENCE_AUDIO) *visual = 1;
+        if (reference->kind == H3_REFERENCE_AUDIO ||
+            reference->kind == H3_REFERENCE_VIDEO_AUDIO ||
+            (reference->kind == H3_REFERENCE_VIDEO &&
+             reference->include_embedded_audio)) *audio = 1;
+    }
+}
+
+static double h3_seconds(void) {
+    struct timespec value;
+    if (clock_gettime(CLOCK_MONOTONIC, &value) != 0) return 0.0;
+    return (double)value.tv_sec + (double)value.tv_nsec * 1e-9;
+}
+
 static void h3_vision_progress_bridge(int completed, int total, void *opaque) {
     h3_progress_emit(opaque, "Qwen vision", completed, total);
 }
@@ -928,6 +982,10 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     memset(&prefetch, 0, sizeof(prefetch));
     pthread_t prefetch_thread;
     int prefetching = 0;
+    h3_dit_early_load early;
+    memset(&early, 0, sizeof(early));
+    pthread_t early_thread;
+    int early_loading = 0;
     h3_live_preview live_preview;
     memset(&live_preview, 0, sizeof(live_preview));
     float *video = NULL, *audio = NULL;
@@ -991,6 +1049,23 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         ctx->dit = NULL;
         free(ctx->dit_key);
         ctx->dit_key = NULL;
+    }
+    const char *early_flag = getenv("H3_DIT_EARLY_LOAD");
+    if (early_flag && *early_flag && strcmp(early_flag, "0") &&
+        !(ctx->cache_enabled && ctx->dit && ctx->dit_key &&
+          !strcmp(ctx->dit_key, prepared_key)) &&
+        h3_serving_schedule_build(params->steps, &early.sigmas)) {
+        early.weight_directory = dit_path;
+        early.active_blocks = (unsigned)params->dit_layers;
+        h3_predict_conditions(params, ref2va, &early.visual_condition,
+                              &early.audio_condition);
+        early.ssd_streaming = params->ssd_streaming;
+        early.use_slower_bf16_mlp = params->use_slower_bf16_mlp;
+        early.use_slower_bf16_qkv = params->use_slower_bf16_qkv;
+        early.use_slower_bf16_attention_output =
+            params->use_slower_bf16_attention_output;
+        early_loading = !pthread_create(&early_thread, NULL,
+                                        h3_dit_early_load_run, &early);
     }
     conditioning_hit = ctx->cache_enabled && ctx->conditioning_key &&
         !strcmp(ctx->conditioning_key, conditioning_key);
@@ -1488,6 +1563,17 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     }
     float spatial_rope_scale = !params->use_reference_rope &&
         render_width == 256 && render_height == 256 ? 0.5f : 1.0f;
+    if (early_loading) {
+        double join_started = h3_seconds();
+        pthread_join(early_thread, NULL);
+        early_loading = 0;
+        if (!early.core)
+            fprintf(stderr, "h3: warning: DiT early load failed: %s\n",
+                    early.error);
+        if (getenv("H3_PROFILE"))
+            fprintf(stderr, "h3 profile: DiT early load join wait=%.3fs\n",
+                    h3_seconds() - join_started);
+    }
     if (ctx->cache_enabled && ctx->dit && ctx->dit_key &&
         !strcmp(ctx->dit_key, prepared_key)) {
         dit = ctx->dit;
@@ -1500,6 +1586,29 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             goto cleanup;
         }
         fprintf(stderr, "h3: prepared DiT cache hit\n");
+    } else if (early.core) {
+        h3_dit_core *core = early.core;
+        early.core = NULL;
+        dit = h3_dit_load_with_core(
+            core, dit_path, "h3_shaders.metal", &text, &layout, &sigmas,
+            (unsigned)params->dit_layers, (unsigned)params->core_reuse,
+            params->token_reduction,
+            params->ssd_streaming,
+            spatial_rope_scale,
+            params->use_slower_bf16_mlp,
+            params->use_slower_bf16_qkv,
+            params->use_slower_bf16_attention_output,
+            params->use_slower_row_major_attention_output,
+            params->use_slower_unfused_int8_inputs,
+            params->use_slower_unfused_qkv_rope,
+            params->use_slower_scalar_qkv_rms,
+            params->use_slower_uncached_int8_scales,
+            params->use_slower_dynamic_fc1_k,
+            params->use_slower_grouped_quantizer,
+            params->use_int8_row_fc2,
+            condition_video_rows, condition_video_elements,
+            condition_audio_rows, condition_audio_elements,
+            h3_dit_progress_bridge, &progress, detail, sizeof(detail));
     } else if (conditioned) {
         dit = h3_dit_load_conditioned(
             dit_path, "h3_shaders.metal", &text, &layout, &sigmas,
@@ -1768,6 +1877,9 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     result->seed = params->seed;
 
 cleanup:
+    /* The early loader reads dit_path, so it is joined before any free. */
+    if (early_loading) pthread_join(early_thread, NULL);
+    h3_dit_core_free(early.core);
     free(conditioning_key);
     free(prepared_key);
     free(decoder_key);
