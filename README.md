@@ -676,23 +676,25 @@ denoise; both leave the output bit-identical. `H3_DUMP_VIDEO_LATENT=<file>`
 saves the final latent, and `make vae_bench` builds a tool that replays just
 the VAE decode from it for timing and PSNR comparisons.
 
-First/last-frame anchors are single images, and the released visual VAE
-encoder's causal 3x3x3 convs pad two zero frames in front of the input, so
-for a one-frame input only the last temporal kernel tap ever touches real data
-(this includes the time-strided downsample convs, whose output stays one frame
-deep). Single-frame encodes therefore run every conv as an F32 Conv2d over the
-reflect-padded frame using `weight[:, :, 2]`, sliced once per encoder. This
-removes the two-thirds of the multiply-adds that were against zeros, and the
-padded buffers become 3x smaller. Each tile reuses one ping-pong scratch arena
-instead of allocating per block, chains its blocks with `h3_gpu_continue` and
-waits once. Both anchors share one Metal context, weight load and graph cache.
-The Conv2d result is mathematically identical but not bit-identical, because
-MPSGraph may use a different accumulation order for Conv2d.
-`H3_VAE_ENCODER_CONV3D=1` keeps the released Conv3d kernels inside the arena
-pipeline: the same padding kernel and Conv3d graphs run on the same inputs, so
-only allocation and synchronization change.
-`H3_DISABLE_VAE_ENCODER_ARENA=1` restores the released per-block allocation and
-waits; multi-frame reference videos always use that path.
+Single-image anchors (first/last frame) are encoded in a reused ping-pong
+scratch arena instead of allocating per block; each tile chains its blocks
+with `h3_gpu_continue` and waits once, and both anchors share one Metal
+context, weight load and graph cache. The same padding kernel and Conv3d
+graphs run on the same inputs, so only allocation and synchronization change
+and the latents stay bit-identical (two 768x1344 anchors: 8.9 s to 5.8 s on an
+M5 Ultra). `H3_DISABLE_VAE_ENCODER_ARENA=1` restores the released per-block
+allocation and waits; multi-frame reference videos always use that path.
+
+`H3_VAE_ENCODER_CONV2D=1` goes further. The encoder's causal 3x3x3 convs pad
+two zero frames in front of the input, so for a one-frame input only the last
+temporal kernel tap ever touches real data (this includes the time-strided
+downsample convs, whose output stays one frame deep). With the switch, every
+conv runs as an F32 Conv2d over the reflect-padded frame using
+`weight[:, :, 2]`, sliced once per encoder, which removes the two-thirds of
+the multiply-adds that were against zeros (two anchors: 1.1 s). The result is
+mathematically identical but not bit-identical, because MPSGraph accumulates
+Conv2d in a different order (latent relative L2 about 3e-6 from the released
+path), so the generated video changes.
 `make h3_vae_encoder_bench` builds a tool that encodes real anchor images with
 all three paths in one process. It prints per-path timing and each path's
 latent max absolute and relative L2 difference from the released path.
