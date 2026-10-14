@@ -692,7 +692,11 @@ kernel each, and the output/MLP biases fold into the residual updates). Every
 value goes through the same arithmetic in the same order, the FFmpeg command
 and the frame bytes it reads are unchanged, so decoded frames, PCM and the
 file bytes are bit-identical; only memory traffic, dispatches, waits and
-serialization change. `H3_VAE_DECODE_LEGACY=1` restores the released path
+serialization change. On an M5 Ultra at 768x1344 and 107 frames with BF16
+projections, the 90-tile decode took 15.1 s instead of 18.0 s (17.5 s with
+the pipeline but unfused epilogues) and the whole tail after the denoise
+16.2 s instead of 19.0 s, with identical RGB/PCM and MP4 file hashes for
+20-step and 6-step renders. `H3_VAE_DECODE_LEGACY=1` restores the released path
 (blocking submit per tile, unfused epilogues, whole-video conversion then
 FFmpeg, inline DiT free) and `H3_VAE_UNFUSED=1` keeps the pipeline but
 unfuses the epilogues. With `H3_PROFILE` the tail prints an
