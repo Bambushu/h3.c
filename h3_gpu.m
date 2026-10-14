@@ -458,6 +458,16 @@ int h3_gpu_has_int8_mlp(const h3_gpu *opaque) {
     return gpu.tensorOpsEnabled;
 }
 
+int h3_gpu_describe(const h3_gpu *opaque, char *buffer, size_t size) {
+    if (!opaque || !buffer || !size) return 0;
+    H3GPU *gpu = GPU((h3_gpu *)(void *)opaque);
+    int written = snprintf(buffer, size, "%s|tensor-ops=%d:%lu",
+                           gpu.device.name.UTF8String,
+                           gpu.tensorOpsEnabled ? 1 : 0,
+                           (unsigned long)gpu.tensorOpsMode);
+    return written > 0 && (size_t)written < size;
+}
+
 static h3_gpu_tensor *h3_gpu_tensor_new(h3_gpu *opaque, const void *values,
                                         size_t elements, size_t item_size,
                                         h3_gpu_dtype dtype) {
@@ -518,14 +528,14 @@ static h3_gpu_tensor *h3_gpu_tensor_load_file(h3_gpu *opaque, const char *path,
                                               size_t elements,
                                               size_t item_size,
                                               h3_gpu_dtype dtype,
-                                              const char *label) {
+                                              const char *label,
+                                              int transformer_weight) {
     H3GPU *gpu = GPU(opaque);
     if (!gpu || !path || !*path || file_offset > INT64_MAX ||
         elements > SIZE_MAX / item_size) return NULL;
     size_t bytes = elements * item_size;
     if ((uint64_t)bytes > (uint64_t)INT64_MAX - file_offset) return NULL;
     const char *zero_copy = getenv("H3_ZERO_COPY_WEIGHTS");
-    int transformer_weight = strstr(path, "/transformer/") != NULL;
     int m5 = [gpu.device.name rangeOfString:@"M5"].location != NSNotFound;
     int map_weight = bytes &&
         ((zero_copy && !strcmp(zero_copy, "1")) ||
@@ -622,13 +632,24 @@ static h3_gpu_tensor *h3_gpu_tensor_load_file(h3_gpu *opaque, const char *path,
 h3_gpu_tensor *h3_gpu_tensor_load_bf16(h3_gpu *opaque, const char *path,
                                        uint64_t file_offset, size_t elements) {
     return h3_gpu_tensor_load_file(opaque, path, file_offset, elements,
-                                   sizeof(uint16_t), H3_GPU_BF16, "BF16");
+                                   sizeof(uint16_t), H3_GPU_BF16, "BF16",
+                                   path && strstr(path, "/transformer/"));
 }
 
 h3_gpu_tensor *h3_gpu_tensor_load_f32(h3_gpu *opaque, const char *path,
                                       uint64_t file_offset, size_t elements) {
     return h3_gpu_tensor_load_file(opaque, path, file_offset, elements,
-                                   sizeof(float), H3_GPU_F32, "F32");
+                                   sizeof(float), H3_GPU_F32, "F32",
+                                   path && strstr(path, "/transformer/"));
+}
+
+h3_gpu_tensor *h3_gpu_tensor_load_cache(h3_gpu *opaque, const char *path,
+                                        uint64_t file_offset, size_t elements,
+                                        h3_gpu_dtype dtype) {
+    size_t item_size = dtype == H3_GPU_I8 ? sizeof(int8_t) :
+                       dtype == H3_GPU_BF16 ? sizeof(uint16_t) : sizeof(float);
+    return h3_gpu_tensor_load_file(opaque, path, file_offset, elements,
+                                   item_size, dtype, "cache", 1);
 }
 
 static int h3_gpu_tensor_read_file_bf16_mode(
@@ -722,6 +743,14 @@ size_t h3_gpu_tensor_elements(const h3_gpu_tensor *tensor) {
 
 h3_gpu_dtype h3_gpu_tensor_dtype(const h3_gpu_tensor *tensor) {
     return tensor ? TENSOR(tensor).dtype : H3_GPU_F32;
+}
+
+size_t h3_gpu_tensor_bytes(const h3_gpu_tensor *tensor) {
+    return tensor ? TENSOR(tensor).bytes : 0;
+}
+
+const void *h3_gpu_tensor_contents(const h3_gpu_tensor *tensor) {
+    return tensor ? TENSOR(tensor).buffer.contents : NULL;
 }
 
 int h3_gpu_tensor_read_f32(const h3_gpu_tensor *tensor, float *values,
@@ -1269,6 +1298,40 @@ int h3_gpu_copy_f32(h3_gpu *opaque, h3_gpu_tensor *destination,
     }
     h3_gpu_stats stats = gpu.stats;
     stats.blit_copies++;
+    gpu.stats = stats;
+    return 1;
+}
+
+int h3_gpu_make_resident(h3_gpu *opaque, h3_gpu_tensor *const *tensors,
+                         size_t count) {
+    H3GPU *gpu = GPU(opaque);
+    if (!h3_gpu_require_command(gpu) || (count && !tensors) ||
+        count > SIZE_MAX / sizeof(uint32_t)) return 0;
+    if (!count) return 1;
+    id<MTLBuffer> sink = [gpu.device
+        newBufferWithLength:count * sizeof(uint32_t)
+                    options:MTLResourceStorageModePrivate];
+    if (!sink) {
+        h3_gpu_set_error(gpu, @"cannot allocate residency sink");
+        return 0;
+    }
+    uint64_t copies = 0;
+    @autoreleasepool {
+        id<MTLBlitCommandEncoder> encoder = [gpu.command blitCommandEncoder];
+        for (size_t index = 0; index < count; index++) {
+            if (!tensors[index] ||
+                TENSOR(tensors[index]).bytes < sizeof(uint32_t)) continue;
+            [encoder copyFromBuffer:TENSOR(tensors[index]).buffer
+                       sourceOffset:0
+                           toBuffer:sink
+                  destinationOffset:index * sizeof(uint32_t)
+                               size:sizeof(uint32_t)];
+            copies++;
+        }
+        [encoder endEncoding];
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.blit_copies += copies;
     gpu.stats = stats;
     return 1;
 }

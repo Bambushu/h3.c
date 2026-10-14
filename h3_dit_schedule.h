@@ -1,6 +1,7 @@
 #ifndef H3_DIT_SCHEDULE_H
 #define H3_DIT_SCHEDULE_H
 
+#include "h3_dit_cache.h"
 #include "h3_gpu.h"
 #include "h3_host.h"
 #include "h3_weights.h"
@@ -21,11 +22,13 @@ typedef void (*h3_dit_schedule_progress)(int completed_blocks,
 
 /* Materialize every per-step AdaLN value. This intentionally submits one
  * projection at a time, so a 498 MiB block projection is released before the
- * next is loaded. */
+ * next is loaded. With a cache (H3_DIT_CACHE) a valid file supplies the exact
+ * projected rows and no AdaLN weight is touched; a miss computes and writes
+ * it. cache may be NULL. */
 h3_dit_schedule *h3_dit_schedule_precompute(
     const h3_weight_store *weights, h3_gpu *gpu,
     const h3_sigma_schedule *sigmas, int visual_condition,
-    int audio_condition,
+    int audio_condition, h3_dit_cache *cache,
     h3_dit_schedule_progress progress, void *progress_opaque,
     char *error, size_t error_size);
 void h3_dit_schedule_free(h3_dit_schedule *schedule);

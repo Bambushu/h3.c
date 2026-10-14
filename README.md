@@ -700,6 +700,64 @@ interactive DiT is ready for its next denoiser evaluation. Measurements reached
 about 13--14.6 GiB/s from the internal SSD. `H3_PROFILE=1` reports total bytes,
 read throughput, and the part of the read wait that was not hidden by GPU work.
 
+### DiT load cache and early load
+
+Each DiT load quantizes every active block's QKV, attention-output, FC1 and FC2
+projections to int8 on the GPU and projects all 50 blocks' AdaLN weights over
+the step schedule. With 50 layers that touches about 60 GiB of BF16 checkpoint
+pages to produce about 18 GiB of results. Two opt-in switches take this work
+off the critical path. Neither changes any output byte.
+
+`H3_DIT_CACHE=<directory>` saves exactly those results. The directory is
+created with mode 0700 if it is missing. Each block gets one file with its int8
+weights and F32 row scales (about 368 MiB, so 18 GiB for 50 blocks). Each step
+schedule and condition kind gets one AdaLN file (about 0.4 GiB at 20 steps).
+Later loads map these files zero-copy, the same way M5 maps transformer
+weights, and make them GPU-resident during the load. They never read the AdaLN
+weights or the BF16 source of a cached matrix.
+
+Files are keyed by:
+
+- a checkpoint fingerprint: the resolved directory plus each shard's name, size
+  and mtime;
+- the block index and the set of stored matrices;
+- the Metal device and TensorOps mode, the macOS build, the shader source
+  content, `H3_INT8_VECTOR_QUANT` and a format version;
+- for AdaLN files only: the step count, every sigma bit, and the visual/audio
+  condition flags.
+
+Because keys are per block, every `--layers` selection shares the same files.
+A missing, stale, truncated or corrupt file silently falls back to the normal
+load. That load rewrites the file through a private temporary file, `fsync` and
+rename. Rewriting a block file also deletes the superseded files for that
+block; stale AdaLN files are small and kept.
+
+`H3_DIT_CACHE_VERIFY=1` recomputes everything the cache supplied and fails the
+load if any byte differs. Each load prints one `h3: DiT cache` summary line.
+With `H3_PROFILE=1` it also reports mapped and written GiB and the write and
+verify times.
+
+`H3_DIT_EARLY_LOAD=1` starts the prompt-independent half of the DiT load on a
+second thread when generation starts: the DiT's Metal context, the AdaLN
+schedule, the gate-ranked layer choice and the persistent block weights. That
+work then overlaps the VAE encoder, Qwen vision and the text encoder. Text
+refinement, row maps, activations and condition rows are still prepared after
+the prompt is encoded, in the same context and with the same kernels as the
+serial path.
+
+The early half is used only if it matches the request: the checkpoint, steps,
+layers, BF16 switches, the visual/audio condition kinds, and a sequence of at
+least 128 rows. If it does not match, or the thread failed, the DiT loads
+serially as before. The DiT then coexists with the encoders, adding about
+20 GiB of peak unified memory, so this mode is intended for 256 GB machines.
+
+With `H3_PROFILE=1`, three lines report the timing:
+
+- `DiT early core`: time spent on the loader thread.
+- `DiT early load join wait`: how long the main thread waited for that thread.
+- `DiT load`: what remained on the main thread, split into phases. It prints
+  in both modes.
+
 ### Metal 4 and TensorOps paths
 
 M5 GPUs automatically use native BF16 Metal 4/TensorOps for the DiT QKV and
@@ -890,7 +948,8 @@ can differ. The current diagnostic implementation retains both BF16 and int8
 MLP weights only when an A/B diagnostic requests them. Normal int8 loading
 releases each block's BF16 FC1/FC2 buffers after their submitted quantization
 finishes, reducing measured peak tensor storage to 25.9 GiB from the BF16
-path's 36.4 GiB. Runtime weight quantization still adds startup time.
+path's 36.4 GiB. Runtime weight quantization still adds startup time unless
+`H3_DIT_CACHE` supplies the int8 weights.
 
 The fastest M5 path also quantizes each DiT QKV projection and writes its
 Q/K/V tiles directly in head-major attention layout before the existing Q/K
@@ -984,4 +1043,5 @@ at every size for A/B comparison.
 
 The native baseline targets the original `FL2VA/` and `Ref2VA/` checkpoint
 trees. Model phases are loaded and released separately so the 33B transformer,
-Qwen encoder, and decoders never have to coexist in unified memory.
+Qwen encoder, and decoders never have to coexist in unified memory. The opt-in
+`H3_DIT_EARLY_LOAD=1` deliberately lets the DiT coexist with the encoders.
