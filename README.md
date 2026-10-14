@@ -9,6 +9,59 @@ Prompt-to-video/audio, first/last-frame conditioning, and ordered Ref2VA
 image/video/audio references work end to end. The current work is incremental
 H3-specific Metal performance and memory optimization on M3 Max and M5 Max.
 
+## Community changes in this fork
+
+Upstream has had no commits or merged pull requests since 2026-08-11. This fork
+integrates reviewed community PRs from antirez/h3.c on top of our own changes
+(compact-QKV, bounded safetensors names #74, on-demand Metal pipelines #75).
+Each PR is merged with its original commits; every change was read for malice
+(network, processes, file writes, build rules, encoded data) and none was found.
+
+On by default, output-neutral apart from the race fix:
+
+| PR | Change |
+| --- | --- |
+| [#63](https://github.com/antirez/h3.c/pull/63) | Barrier before reusing the GQA reduction scratch: fixes a race in the text encoder's attention ([#52](https://github.com/antirez/h3.c/issues/52)) |
+| [#44](https://github.com/antirez/h3.c/pull/44) | 16-byte threadgroup memory length for causal GQA (Metal API validation) |
+| [#9](https://github.com/antirez/h3.c/pull/9) | Video VAE RGB output stays finite for non-finite values |
+| [#11](https://github.com/antirez/h3.c/pull/11) | No integer overflow when aligning huge frame counts |
+| [#48](https://github.com/antirez/h3.c/pull/48) | Reject overlapping or gapped safetensors payload offsets |
+| [#56](https://github.com/antirez/h3.c/pull/56) | Register MiniMax's seven control tokens (`<d>`, `</d>`, `<\|cutoff\|>`, caption/lyrics markers); plain prompts tokenize identically |
+| [#59](https://github.com/antirez/h3.c/pull/59) | Build against SDKs older than macOS 26 |
+| [#62](https://github.com/antirez/h3.c/pull/62) | Line-buffer stdout so interactive `Done` lines reach pipes |
+| [#10](https://github.com/antirez/h3.c/pull/10) | Accurate preset, help and callback documentation |
+
+Opt-in, unchanged unless enabled:
+
+| PR | Enable with | Notes |
+| --- | --- | --- |
+| [#73](https://github.com/antirez/h3.c/pull/73) | `H3_VAE_PRECISION=bf16`, `H3_VAE_PREFETCH=1`, `H3_VAE_CACHE=<dir>` | BF16 video VAE decode, decoder load overlapped with the denoise, cached lowered weights. Prefetch and cache are bit-identical; BF16 changes pixels slightly |
+| [#64](https://github.com/antirez/h3.c/pull/64) | `H3_SDPA_MAX_QUERY_ROWS=2048` or `--sdpa-query-block 2048` | Splits long non-causal SDPA queries to avoid MPSGraph corruption on M2/M3 Ultra. Off by default here (upstream PR defaults on) |
+| [#14](https://github.com/antirez/h3.c/pull/14) | `tools/fold_turbo_lora.py` | Offline tool and docs only: fold a step-distillation LoRA into a separate checkpoint for 5-6 step sampling |
+
+Measured on Mac Studio M5 Ultra (256 GB) with the Image Studio draft
+(864×480, 56 frames, `--steps 8 --layers 50 --reuse 1`) and standard
+(1344×768, 56 frames, `--steps 20 --layers 50 --reuse 2`) commands, seed 17,
+warm file cache, one run per configuration:
+
+- Default build: decoded RGB and PCM SHA-256 identical to the previous build for
+  both profiles (draft 37.0 s, standard 117.5 s).
+- `H3_VAE_PREFETCH=1`: bit-identical output; draft 36.5 s.
+- `H3_VAE_PRECISION=bf16 H3_VAE_PREFETCH=1`: draft 29.8 s (-20%), standard
+  99.3 s (-16%); audio identical; video PSNR against F32 53.1 dB (draft) and
+  50.7 dB (standard), worst frame 50.0 dB.
+- MPSGraph non-causal SDPA (56 heads × 128, BF16) at 6,978-33,000 rows matched a
+  float64 reference on 672 sampled row/head pairs per length with and without the
+  #64 split, so the Ultra corruption was not reproduced on M5 Ultra.
+
+Reviewed and not merged: #1 (smaller default VAE tiles: slower, changes output),
+#4 (moves GQA away from MLX parity), #7 and #34 (code paths the CLI does not use),
+#31 (would silently stretch rotated references), #32 (embedded shaders, unused
+when run from the source directory), #33 (default-on lock files, `/tmp` symlink
+hazard), #35 and #68 (interactive-only, #35 non-functional), #55 (SSD attention
+streaming for small-memory Macs), #14's header-alignment check (breaks valid
+files). Out of scope: #2, #43 (CUDA), #45 (GUI) and documentation-only PRs.
+
 ## Tutorial
 
 ### 1. Build and inspect the model
