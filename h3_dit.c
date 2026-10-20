@@ -95,6 +95,19 @@ struct h3_dit {
     int fused_patch_pack;
     int token_reduction;
     int token_reduction_active;
+    /* Sol-Attn block-sparse attention (H3_SOL_ATTN). The scratch below is
+     * shared by all 50 blocks; routes exists only for H3_PROFILE_SOL_ROUTES. */
+    int sol_attention;
+    float sol_attention_tau;
+    h3_gpu_tensor *sol_query_centroids;
+    h3_gpu_tensor *sol_key_centroids;
+    h3_gpu_tensor *sol_value_sums;
+    h3_gpu_tensor *sol_key_means;
+    h3_gpu_tensor *sol_key_variances;
+    h3_gpu_tensor *sol_thresholds;
+    h3_gpu_tensor *sol_routes;
+    size_t sol_route_count;
+    int sol_routes_reported;
     unsigned token_reduction_begin;
     unsigned token_reduction_end;
     unsigned token_reduction_early_steps;
@@ -1588,6 +1601,64 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
            dit->final_video_b && dit->final_audio_w && dit->final_audio_b;
 }
 
+/* Sol-Attn is opt-in (H3_SOL_ATTN=1) and only pays off on long sequences:
+ * below H3_SOL_ATTN_MIN_ROWS (default 4096) the dense path stays. Token
+ * reduction already reshapes the sequence and is left alone. */
+#define H3_DIT_SOL_ATTENTION_ROWS 4096u
+
+static int configure_sol_attention(h3_dit *dit,
+                                   char *error, size_t error_size) {
+    const char *enabled = getenv("H3_SOL_ATTN");
+    dit->sol_attention_tau = -1.0f;
+    if (!enabled || !*enabled || !strcmp(enabled, "0")) return 1;
+    uint32_t minimum_rows = H3_DIT_SOL_ATTENTION_ROWS;
+    const char *minimum_text = getenv("H3_SOL_ATTN_MIN_ROWS");
+    if (minimum_text && *minimum_text) {
+        char *tail = NULL;
+        unsigned long parsed = strtoul(minimum_text, &tail, 10);
+        if (tail == minimum_text || *tail || parsed > UINT32_MAX) {
+            fail(error, error_size,
+                 "H3_SOL_ATTN_MIN_ROWS must be an unsigned 32-bit integer");
+            return 0;
+        }
+        minimum_rows = (uint32_t)parsed;
+    }
+    const char *tau_text = getenv("H3_SOL_ATTN_TAU");
+    if (tau_text && *tau_text) {
+        char *tail = NULL;
+        float tau = strtof(tau_text, &tail);
+        if (tail == tau_text || *tail || !isfinite(tau) ||
+            tau < -100.0f || tau > 10.0f) {
+            fail(error, error_size,
+                 "H3_SOL_ATTN_TAU must be finite and in [-100, 10]");
+            return 0;
+        }
+        dit->sol_attention_tau = tau;
+    }
+    if (dit->sequence < minimum_rows || dit->token_reduction) {
+        fprintf(stderr,
+                "h3: Sol-Attn requested but inactive (%u rows, minimum %u%s)\n",
+                dit->sequence, minimum_rows,
+                dit->token_reduction ? ", token reduction enabled" : "");
+        return 1;
+    }
+    if (!h3_gpu_has_sol_attention(dit->gpu)) {
+        const char *strict = getenv("H3_SOL_ATTN_STRICT");
+        if (strict && *strict && strcmp(strict, "0")) {
+            fail(error, error_size,
+                 "H3_SOL_ATTN requested but the Sol-Attn Metal library is unavailable");
+            return 0;
+        }
+        fprintf(stderr,
+                "h3: Sol-Attn requested but unavailable; using dense attention\n");
+        return 1;
+    }
+    dit->sol_attention = 1;
+    fprintf(stderr, "h3: Sol-Attn enabled (tau %.3f, %u rows)\n",
+            dit->sol_attention_tau, dit->sequence);
+    return 1;
+}
+
 static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
     size_t sequence = dit->sequence;
     size_t audio = dit->audio_rows;
@@ -1674,6 +1745,43 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
              "cannot allocate DiT activation buffers: %s",
              h3_gpu_error(dit->gpu));
         return 0;
+    }
+    if (dit->sol_attention) {
+        size_t blocks = (sequence + 63u) / 64u;
+        size_t summaries = (size_t)HEADS * blocks * HEAD_DIM;
+        size_t statistics = (size_t)HEADS * HEAD_DIM;
+        size_t thresholds = (size_t)HEADS * blocks;
+        dit->sol_query_centroids = h3_gpu_tensor_new_f32(dit->gpu, summaries);
+        dit->sol_key_centroids = h3_gpu_tensor_new_bf16(dit->gpu, summaries);
+        dit->sol_value_sums = h3_gpu_tensor_new_bf16(dit->gpu, summaries);
+        dit->sol_key_means = h3_gpu_tensor_new_f32(dit->gpu, statistics);
+        dit->sol_key_variances = h3_gpu_tensor_new_f32(dit->gpu, statistics);
+        dit->sol_thresholds = h3_gpu_tensor_new_f32(dit->gpu, thresholds);
+        if (!dit->sol_query_centroids || !dit->sol_key_centroids ||
+            !dit->sol_value_sums || !dit->sol_key_means ||
+            !dit->sol_key_variances || !dit->sol_thresholds) {
+            fail(error, error_size,
+                 "cannot allocate Sol-Attn routing buffers: %s",
+                 h3_gpu_error(dit->gpu));
+            return 0;
+        }
+        const char *profile_routes = getenv("H3_PROFILE_SOL_ROUTES");
+        if (profile_routes && *profile_routes && strcmp(profile_routes, "0")) {
+            if (blocks > SIZE_MAX / blocks / HEADS) {
+                fail(error, error_size,
+                     "Sol-Attn route diagnostic size overflows");
+                return 0;
+            }
+            dit->sol_route_count = (size_t)HEADS * blocks * blocks;
+            dit->sol_routes = h3_gpu_tensor_new_i8(dit->gpu,
+                                                   dit->sol_route_count);
+            if (!dit->sol_routes) {
+                fail(error, error_size,
+                     "cannot allocate Sol-Attn route diagnostics: %s",
+                     h3_gpu_error(dit->gpu));
+                return 0;
+            }
+        }
     }
     if (getenv("H3_DISABLE_FUSED_FINAL_SLICE")) {
         dit->final_audio_input = h3_gpu_tensor_new_bf16(
@@ -2020,7 +2128,8 @@ static h3_dit *load_dit(h3_dit_core *core,
     if (!copy_layout(dit, layout, error, error_size) ||
         !validate_layout(dit, text, error, error_size) ||
         !configure_token_reduction(dit, token_reduction,
-                                   error, error_size)) goto failed;
+                                   error, error_size) ||
+        !configure_sol_attention(dit, error, error_size)) goto failed;
     size_t wanted_video_condition =
         (size_t)dit->video_condition_rows * VIDEO_PATCH;
     size_t wanted_audio_condition =
@@ -2400,6 +2509,64 @@ static int leave_token_reduction_adaln(h3_dit *dit, unsigned block,
     return 1;
 }
 
+/* Sparse attention runs in the 20%-90% window of the schedule, the window
+ * the published H3 SolAttn integration uses: the noisiest opening passes and
+ * the final-detail pass stay dense. H3_SOL_ATTN_ALL_STEPS=1 removes the
+ * window for diagnosis. */
+static int use_sol_attention(const h3_dit *dit, int step) {
+    if (!dit->sol_attention || dit->token_reduction_active) return 0;
+    const char *all_steps = getenv("H3_SOL_ATTN_ALL_STEPS");
+    if (all_steps && *all_steps && strcmp(all_steps, "0")) return 1;
+    int steps = h3_dit_schedule_steps(dit->schedule);
+    if (steps < 3 || step < 0 || step >= steps) return 0;
+    int denominator = steps - 1;
+    return step * 10 >= denominator * 2 &&
+           step * 10 <= denominator * 9;
+}
+
+/* H3_PROFILE_SOL_ROUTES=1: once per generation, materialize the routing mask
+ * of the first sparse layer and print its density. */
+static int report_sol_route_density(h3_dit *dit, unsigned block, int step,
+                                    uint32_t rows,
+                                    char *error, size_t error_size) {
+    if (!dit->sol_routes || dit->sol_routes_reported) return 1;
+    if (!h3_gpu_sol_attention_routes_bf16(
+            dit->gpu, dit->sol_routes,
+            dit->sol_query_centroids, dit->sol_key_centroids,
+            dit->sol_thresholds, rows, HEADS, HEAD_DIM,
+            dit->video_target_start, 1.0f / sqrtf((float)HEAD_DIM)) ||
+        !h3_gpu_submit(dit->gpu)) {
+        fail(error, error_size, "cannot profile Sol-Attn routes: %s",
+             h3_gpu_error(dit->gpu));
+        return 0;
+    }
+    int8_t *routes = malloc(dit->sol_route_count);
+    if (!routes) {
+        fail(error, error_size,
+             "out of memory reading Sol-Attn route diagnostics");
+        return 0;
+    }
+    int read = h3_gpu_tensor_read_i8(dit->sol_routes, routes,
+                                     dit->sol_route_count);
+    size_t selected = 0;
+    if (read)
+        for (size_t i = 0; i < dit->sol_route_count; i++)
+            selected += routes[i] != 0;
+    free(routes);
+    if (!read || !h3_gpu_begin(dit->gpu)) {
+        fail(error, error_size, "cannot read Sol-Attn route diagnostics: %s",
+             h3_gpu_error(dit->gpu));
+        return 0;
+    }
+    dit->sol_routes_reported = 1;
+    fprintf(stderr,
+            "h3: Sol-Attn routes block=%u step=%d selected=%zu/%zu "
+            "density=%.4f\n",
+            block, step + 1, selected, dit->sol_route_count,
+            (double)selected / (double)dit->sol_route_count);
+    return 1;
+}
+
 static int run_block(h3_dit *dit, unsigned index, int step,
                      h3_dit_block *weight,
                      int attention_adaln_ready,
@@ -2450,7 +2617,19 @@ static int run_block(h3_dit *dit, unsigned index, int step,
         !dit->use_slower_row_major_attention_output &&
         !dit->use_slower_uncached_int8_scales &&
         !getenv("H3_DISABLE_HEAD_MAJOR_ATTENTION_OUTPUT");
-    if (head_major_attention_output)
+    int sol_active = use_sol_attention(dit, step);
+    if (sol_active)
+        OP(h3_gpu_sol_attention_bf16(
+            dit->gpu, dit->attention_heads,
+            dit->query, dit->key, dit->value,
+            dit->sol_query_centroids, dit->sol_key_centroids,
+            dit->sol_value_sums, dit->sol_key_means,
+            dit->sol_key_variances, dit->sol_thresholds,
+            rows, HEADS, HEAD_DIM, dit->video_target_start,
+            1.0f / sqrtf((float)HEAD_DIM), dit->sol_attention_tau,
+            head_major_attention_output),
+           "DiT Sol block-sparse attention");
+    else if (head_major_attention_output)
         OP(h3_gpu_sdpa_bf16_head_major_output(
             dit->gpu, dit->attention_heads, dit->query, dit->key, dit->value,
             rows, HEADS, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)),
@@ -2460,6 +2639,9 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             dit->gpu, dit->attention_heads, dit->query, dit->key, dit->value,
             rows, HEADS, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)),
            "DiT full attention");
+    if (sol_active &&
+        !report_sol_route_density(dit, index, step, rows, error, error_size))
+        return 0;
     if (int8_attention_output) {
         if (head_major_attention_output)
             OP(h3_gpu_linear_int8_head_major_bf16(
@@ -3570,6 +3752,9 @@ void h3_dit_free(h3_dit *dit) {
     FREE(video_output);
     FREE(audio_output_bf16); FREE(video_output_bf16);
     FREE(previous_audio_velocity); FREE(previous_video_velocity);
+    FREE(sol_query_centroids); FREE(sol_key_centroids); FREE(sol_value_sums);
+    FREE(sol_key_means); FREE(sol_key_variances); FREE(sol_thresholds);
+    FREE(sol_routes);
 #undef FREE
     h3_dit_schedule_free(dit->schedule);
     if (dit->ssd_streaming && getenv("H3_PROFILE")) {

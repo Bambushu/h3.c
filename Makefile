@@ -95,6 +95,9 @@ h3_semantic_dit_test: tests/test_semantic_dit.o $(LIB_OBJ)
 h3_dit_bench: tests/bench_dit.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
+h3_sol_attention_bench: tests/bench_sol_attention.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
 h3_dit_bench_864: tests/bench_dit_864.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 

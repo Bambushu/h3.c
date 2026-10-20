@@ -94,6 +94,8 @@ int h3_gpu_tensor_read_f32(const h3_gpu_tensor *tensor, float *values,
 int h3_gpu_tensor_read_f32_range(const h3_gpu_tensor *tensor,
                                  size_t source_offset, float *values,
                                  size_t elements);
+int h3_gpu_tensor_read_i8(const h3_gpu_tensor *tensor, int8_t *values,
+                          size_t elements);
 int h3_gpu_tensor_read_bf16(const h3_gpu_tensor *tensor, uint16_t *values,
                             size_t elements);
 int h3_gpu_tensor_write_f32(h3_gpu_tensor *tensor, const float *values,
@@ -568,6 +570,37 @@ int h3_gpu_grouped_qkv_linear_rope_int8(
                                  int use_slower_unfused_qkv_rope,
                                  int use_slower_scalar_qkv_rms,
                                  int use_slower_uncached_int8_scales);
+/* Sol-Attn: training-free 64-token block-sparse attention for long H3
+ * sequences, from a separate Metal library (h3_sol_attention.metal) that is
+ * loaded only when H3_SOL_ATTN is set. Scratch tensors are caller-owned so 50
+ * blocks reuse one allocation. */
+int h3_gpu_has_sol_attention(const h3_gpu *gpu);
+int h3_gpu_sol_attention_bf16(
+                                h3_gpu *gpu, h3_gpu_tensor *output,
+                                const h3_gpu_tensor *query,
+                                const h3_gpu_tensor *key,
+                                const h3_gpu_tensor *value,
+                                h3_gpu_tensor *query_centroids,
+                                h3_gpu_tensor *key_centroids,
+                                h3_gpu_tensor *value_sums,
+                                h3_gpu_tensor *key_means,
+                                h3_gpu_tensor *key_variances,
+                                h3_gpu_tensor *thresholds,
+                                uint32_t sequence, uint32_t heads,
+                                uint32_t head_dim, uint32_t sink_tokens,
+                                float scale, float tau,
+                                int head_major_output);
+/* Materialize Sol-Attn's block routing mask for calibration. Call it after
+ * h3_gpu_sol_attention_bf16 has populated the summaries and thresholds.
+ * `routes` holds one byte per [head, query block, key block]. */
+int h3_gpu_sol_attention_routes_bf16(
+                                h3_gpu *gpu, h3_gpu_tensor *routes,
+                                const h3_gpu_tensor *query_centroids,
+                                const h3_gpu_tensor *key_centroids,
+                                const h3_gpu_tensor *thresholds,
+                                uint32_t sequence, uint32_t heads,
+                                uint32_t head_dim, uint32_t sink_tokens,
+                                float scale);
 int h3_gpu_sdpa_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                      const h3_gpu_tensor *query, const h3_gpu_tensor *key,
                      const h3_gpu_tensor *value, uint32_t sequence,
