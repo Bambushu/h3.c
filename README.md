@@ -9,13 +9,26 @@ Prompt-to-video/audio, first/last-frame conditioning, and ordered Ref2VA
 image/video/audio references work end to end. The current work is incremental
 H3-specific Metal performance and memory optimization on M3 Max and M5 Max.
 
-## Community changes in this fork
+## This fork
 
-Upstream has had no commits or merged pull requests since 2026-08-11. This fork
-integrates reviewed community PRs from antirez/h3.c on top of our own changes
-(compact-QKV, bounded safetensors names #74, on-demand Metal pipelines #75).
-Each PR is merged with its original commits; every change was read for malice
-(network, processes, file writes, build rules, encoded data) and none was found.
+[antirez/h3.c](https://github.com/antirez/h3.c) has had no commits or merged pull
+requests since 2026-08-11. This fork (Bambushu/h3.c) is where that engine keeps
+moving for one workload: 9:16 production shots on a 48 GB M5 Pro, 0.5 to 1 MP,
+5 to 15 seconds, with speech. `main` mirrors upstream; `integration` is the
+branch to build and use; features land on `feat/*` branches so they stay
+upstreamable. `docs/fork-census-2026-10-21.md` maps every fork, PR and
+derivative of h3.c with what each one measured, and is the basis for what is
+merged here and what comes next.
+
+### Base: jerryfane's reviewed integration
+
+The branch starts from
+[jerryfane/h3.c `community-integration`](https://github.com/jerryfane/h3.c/tree/community-integration)
+(d0de0b6, 2026-10-14), which merged the community PRs below with their original
+commits after reading each for malice (network, processes, file writes, build
+rules, encoded data), and added a pipelined video-VAE decode tail, fused block
+epilogues, an opt-in DiT load cache with early load, a compact QKV arena, and
+PRs #74 and #75. Its measurements are reproduced here as published.
 
 On by default, output-neutral apart from the race fix:
 
@@ -30,6 +43,8 @@ On by default, output-neutral apart from the race fix:
 | [#59](https://github.com/antirez/h3.c/pull/59) | Build against SDKs older than macOS 26 |
 | [#62](https://github.com/antirez/h3.c/pull/62) | Line-buffer stdout so interactive `Done` lines reach pipes |
 | [#10](https://github.com/antirez/h3.c/pull/10) | Accurate preset, help and callback documentation |
+| [#74](https://github.com/antirez/h3.c/pull/74) | Safetensors JSON string buffers sized from the encoded string |
+| [#75](https://github.com/antirez/h3.c/pull/75) | Metal pipelines compiled on first use and cached per GPU context |
 
 Opt-in, unchanged unless enabled:
 
@@ -39,10 +54,9 @@ Opt-in, unchanged unless enabled:
 | [#64](https://github.com/antirez/h3.c/pull/64) | `H3_SDPA_MAX_QUERY_ROWS=2048` or `--sdpa-query-block 2048` | Splits long non-causal SDPA queries to avoid MPSGraph corruption on M2/M3 Ultra. Off by default here (upstream PR defaults on) |
 | [#14](https://github.com/antirez/h3.c/pull/14) | `tools/fold_turbo_lora.py` | Offline tool and docs only: fold a step-distillation LoRA into a separate checkpoint for 5-6 step sampling |
 
-Measured on Mac Studio M5 Ultra (256 GB) with the Image Studio draft
-(864×480, 56 frames, `--steps 8 --layers 50 --reuse 1`) and standard
-(1344×768, 56 frames, `--steps 20 --layers 50 --reuse 2`) commands, seed 17,
-warm file cache, one run per configuration:
+jerryfane measured on a Mac Studio M5 Ultra (256 GB), draft (864×480, 56
+frames, `--steps 8 --layers 50 --reuse 1`) and standard (1344×768, 56 frames,
+`--steps 20 --layers 50 --reuse 2`), seed 17, warm file cache, one run each:
 
 - Default build: decoded RGB and PCM SHA-256 identical to the previous build for
   both profiles (draft 37.0 s, standard 117.5 s).
@@ -54,13 +68,29 @@ warm file cache, one run per configuration:
   float64 reference on 672 sampled row/head pairs per length with and without the
   #64 split, so the Ultra corruption was not reproduced on M5 Ultra.
 
-Reviewed and not merged: #1 (smaller default VAE tiles: slower, changes output),
-#4 (moves GQA away from MLX parity), #7 and #34 (code paths the CLI does not use),
-#31 (would silently stretch rotated references), #32 (embedded shaders, unused
-when run from the source directory), #33 (default-on lock files, `/tmp` symlink
-hazard), #35 and #68 (interactive-only, #35 non-functional), #55 (SSD attention
-streaming for small-memory Macs), #14's header-alignment check (breaks valid
-files). Out of scope: #2, #43 (CUDA), #45 (GUI) and documentation-only PRs.
+### Added on top
+
+| Change | Source | Why |
+| --- | --- | --- |
+| 256-pixel video VAE tiles by default | [#1](https://github.com/antirez/h3.c/pull/1) | The geometry scan picked 320-pixel tiles at 576×1024 and 768×1344 and printed a fixed 16-pixel grid on skin and walls (measured 2026-10-10: grid score 1.81 to 1.10 at 768×1344, same latents). Decode is about 14% slower. `H3_VAE_TILE_PIXELS` still overrides |
+| `--sampler euler\|res`, `--scheduler linear\|simple\|beta\|beta57` | [ldoroshe/h3.c](https://github.com/ldoroshe/h3.c) 8631fcf | Match finetunes and adapters published with ComfyUI sampler presets; the beta grids reproduce ComfyUI's index selection. Defaults are byte-identical to before |
+| `--shift F` and `!shift` | after [neysay/h3.c](https://github.com/neysay/h3.c) debd9a1 | The video sigma shift (released: 12) as a parameter, for adapters trained at another shift. The prepared-transformer key carries scheduler and shift |
+| `--first-frame` center-crops to the render aspect | [JunzoKamahara/h3.c](https://github.com/JunzoKamahara/h3.c) b17de03 | It stretched while `--last-frame` cropped; plates whose aspect differed from the canvas were squashed |
+| H.264 `-preset slow` | [#70](https://github.com/antirez/h3.c/issues/70) | The fast preset added its own blocking on top of the decoded frames. CRF stays 18 |
+
+Reviewed and not merged, following jerryfane's notes: #4 (moves GQA away from
+MLX parity), #7 and #34 (code paths the CLI does not use), #31 (would silently
+stretch rotated references), #32 (embedded shaders, unused when run from the
+source directory), #33 (default-on lock files, `/tmp` symlink hazard), #35 and
+#68 (interactive-only, #35 non-functional), #55 (SSD attention streaming for
+small-memory Macs; candidate for later), #14's header-alignment check (breaks
+valid files). Out of scope: #2, #43 (CUDA), #45 (GUI) and documentation-only PRs.
+
+Next: a port of the Sol sparse-attention Metal kernel
+(AlexanderIstomin/h3.c, isolated in fzeng656/h3.c) behind a flag, validated at
+a fixed seed against dense attention. Attention is the bulk of the denoise at
+production shapes and no dense kernel measured so far beats MPSGraph there; the
+census has the numbers.
 
 ## Tutorial
 
@@ -525,41 +555,6 @@ uncompressed media file is created.
 
 The remainder documents the implementation behind the tutorial presets and the
 environment variables retained for exact A/B diagnosis.
-
-### Local on-demand pipeline deployment — 2026-10-14
-
-The installed binary includes the measured on-demand Metal pipeline implementation
-from [upstream PR #75](https://github.com/antirez/h3.c/pull/75), while preserving the
-parser and compact-QKV fixes. Direct pipelines are compiled on first use and cached
-within their GPU context; shader-library compilation and arithmetic are unchanged.
-
-One real Studio API draft job produced 56 frames at 864×480 / 24 fps with stereo
-32 kHz audio, seed 17. Complete software decoding, gallery publication and advancing
-browser playback passed. Studio was not restarted, and no generation settings,
-weights, shaders, image runtime or service configuration changed. This serving smoke
-does not establish an API-latency improvement. The public URL remains Access protected;
-verification exercised the actual local backend.
-
-Source, binary, build/API/media/browser receipts and exact rollback files are under
-`../runtimes/lazy-pipelines-20261014/`. For rollback, wait for idle and atomically
-restore that directory's `rollback/h3` to `h3.c/h3`, then restore its `h3_gpu.m` and
-`README.md`. Subsequent workers use the restored binary without a service restart.
-
-### Local parser allocation deployment — 2026-10-14
-
-The installed binary includes [upstream PR #74](https://github.com/antirez/h3.c/pull/74):
-JSON string buffers are sized from the encoded string, rather than the remaining
-safetensors header. The previously installed compact-QKV optimization is preserved.
-The parser change reduces retained tensor-name capacity, not total model memory;
-no generation speedup is claimed.
-
-A real Studio API draft job produced a 56-frame 864×480 clip with stereo audio.
-Complete software decoding, gallery publication and browser playback passed.
-Studio was not restarted; profiles, weights, image runtime and service configuration
-were unchanged. The versioned binary, source, verification and provenance are under
-`../runtimes/parser-allocation-20261014/`. For rollback, wait for idle and atomically
-restore that directory's `rollback/h3` to `h3.c/h3`, then restore the backed-up
-`h3_safetensors.c` and `README.md`. Subsequent workers use the restored binary.
 
 ### Sampler and DiT controls
 
