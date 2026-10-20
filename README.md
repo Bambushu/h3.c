@@ -18,7 +18,9 @@ moving for one workload: 9:16 production shots on a 48 GB M5 Pro, 0.5 to 1 MP,
 branch to build and use; features land on `feat/*` branches so they stay
 upstreamable. `docs/fork-census-2026-10-21.md` maps every fork, PR and
 derivative of h3.c with what each one measured, and is the basis for what is
-merged here and what comes next.
+merged here and what comes next. `docs/bench-2026-10-21.md` measures upstream
+against this fork on an M5 Pro: the bf16 video VAE lane, Sol-Attn, and where
+the time goes.
 
 ### Base: jerryfane's reviewed integration
 
