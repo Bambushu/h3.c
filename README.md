@@ -77,6 +77,32 @@ frames, `--steps 8 --layers 50 --reuse 1`) and standard (1344×768, 56 frames,
 | `--shift F` and `!shift` | after [neysay/h3.c](https://github.com/neysay/h3.c) debd9a1 | The video sigma shift (released: 12) as a parameter, for adapters trained at another shift. The prepared-transformer key carries scheduler and shift |
 | `--first-frame` center-crops to the render aspect | [JunzoKamahara/h3.c](https://github.com/JunzoKamahara/h3.c) b17de03 | It stretched while `--last-frame` cropped; plates whose aspect differed from the canvas were squashed |
 | H.264 `-preset slow` | [#70](https://github.com/antirez/h3.c/issues/70) | The fast preset added its own blocking on top of the decoded frames. CRF stays 18 |
+| Sol-Attn block-sparse attention, opt-in | [AlexanderIstomin/h3.c](https://github.com/AlexanderIstomin/h3.c) `perf/h3-sol-attn-metal`, compiler fixes from [fzeng656/h3.c](https://github.com/fzeng656/h3.c); kernel by [yshenaw](https://github.com/yshenaw/ComfyUI-SolAttn-MPS) | Attention is the bulk of the denoise at production shapes and no dense kernel beats MPSGraph there. See below |
+
+### Sol-Attn (experimental)
+
+`H3_SOL_ATTN=1` loads `h3_sol_attention.metal` beside the main shaders and
+routes the DiT's self-attention through a training-free 64-token block-sparse
+kernel: per-block query/key centroids pick which key blocks each query block
+reads, everything before the video rows (text, conditioning, references,
+audio) is attended exactly, and the first 20% and last 10% of the steps stay
+dense. Below 4,096 rows the dense path is kept. Dense runs are bit-identical
+with the flag unset.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `H3_SOL_ATTN` | unset | `1` enables the sparse path |
+| `H3_SOL_ATTN_TAU` | `-1` | Routing threshold; higher is sparser. yshenaw's ComfyUI runs used 1.3 |
+| `H3_SOL_ATTN_MIN_ROWS` | `4096` | Smallest sequence that routes sparsely |
+| `H3_SOL_ATTN_ALL_STEPS` | unset | `1` removes the dense opening/closing steps |
+| `H3_SOL_ATTN_STRICT` | unset | `1` makes a missing library or buffer an error instead of a dense fallback |
+| `H3_PROFILE_SOL_ROUTES` | unset | `1` prints the first sparse layer's route density once per generation |
+
+`make h3_sol_attention_bench` builds the kernel bench:
+`./h3_sol_attention_bench h3_shaders.metal TOKENS ITERATIONS TAU SINK_TOKENS`
+reports dense and sparse times, route density and the cosine against dense
+attention on deterministic random Q/K/V; `SINK_TOKENS` equal to `TOKENS` is the
+exact-attention control and must come back with cosine above 0.99999.
 
 Reviewed and not merged, following jerryfane's notes: #4 (moves GQA away from
 MLX parity), #7 and #34 (code paths the CLI does not use), #31 (would silently
