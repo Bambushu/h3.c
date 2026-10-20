@@ -163,17 +163,24 @@ failed:
     return NULL;
 }
 
+static double h3_video_shift(const h3_params *params) {
+    return params->video_shift != 0.0 ? params->video_shift
+                                      : H3_VIDEO_SIGMA_SHIFT;
+}
+
 static char *h3_prepared_key(const char *conditioning,
                              const h3_params *params,
                              int render_width, int render_height) {
     h3_key key = {0};
     if (!h3_key_append(
             &key,
-            "%s|shape=%dx%dx%d|steps=%d|layers=%d|reuse-core=%d|reduce=%d"
+            "%s|shape=%dx%dx%d|steps=%d|scheduler=%d|shift=%.9g|layers=%d"
+            "|reuse-core=%d|reduce=%d"
             "|row-fc2=%d|reference-rope=%d|ssd-streaming=%d"
             "|slow=%d%d%d%d%d%d%d%d%d%d",
             conditioning, render_width, render_height, params->frames,
-            params->steps, params->dit_layers, params->core_reuse,
+            params->steps, params->scheduler, h3_video_shift(params),
+            params->dit_layers, params->core_reuse,
             params->token_reduction, params->use_int8_row_fc2,
             params->use_reference_rope,
             params->ssd_streaming,
@@ -534,6 +541,13 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
     if (params->scheduler < H3_SCHEDULER_LINEAR ||
         params->scheduler > H3_SCHEDULER_BETA57) {
         h3_set_error(ctx, "unknown noise scheduler");
+        return 0;
+    }
+    if (params->video_shift != 0.0 &&
+        !(params->video_shift >= H3_MIN_VIDEO_SIGMA_SHIFT &&
+          params->video_shift <= H3_MAX_VIDEO_SIGMA_SHIFT)) {
+        h3_set_error(ctx, "video sigma shift must be in [%g, %g]",
+                     H3_MIN_VIDEO_SIGMA_SHIFT, H3_MAX_VIDEO_SIGMA_SHIFT);
         return 0;
     }
     if (params->sampler == H3_SAMPLER_RES &&
@@ -1138,7 +1152,9 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     if (early_flag && *early_flag && strcmp(early_flag, "0") &&
         !(ctx->cache_enabled && ctx->dit && ctx->dit_key &&
           !strcmp(ctx->dit_key, prepared_key)) &&
-        h3_serving_schedule_build(params->steps, &early.sigmas)) {
+        h3_serving_schedule_build_shifted(params->steps, params->scheduler,
+                                          h3_video_shift(params),
+                                          &early.sigmas)) {
         early.weight_directory = dit_path;
         early.active_blocks = (unsigned)params->dit_layers;
         h3_predict_conditions(params, ref2va, &early.visual_condition,
@@ -1653,8 +1669,9 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         goto cleanup;
     }
     h3_sigma_schedule sigmas;
-    if (!h3_serving_schedule_build_ex(params->steps, params->scheduler,
-                                      &sigmas)) {
+    if (!h3_serving_schedule_build_shifted(params->steps, params->scheduler,
+                                           h3_video_shift(params),
+                                           &sigmas)) {
         h3_set_error(ctx, "cannot construct the requested sigma schedule");
         goto cleanup;
     }

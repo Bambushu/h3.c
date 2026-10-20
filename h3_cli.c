@@ -159,6 +159,7 @@ static void print_help(void) {
     puts("  !reuse [N]               Set or show denoiser reuse");
     puts("  !sampler [euler|res]     Set or show the integrator");
     puts("  !scheduler [NAME]        Set or show linear|simple|beta|beta57");
+    puts("  !shift [F]               Set or show the video sigma shift (12)");
     puts("  !layers [N]              Set or show active DiT blocks");
     puts("  !core-reuse [N]          Set or show core reuse");
     puts("  !token-reduction [on|off]  Toggle token reduction");
@@ -601,6 +602,22 @@ static int process_command(h3_cli_state *state, char *line, int *repeat) {
         else
             fprintf(stderr,
                     "h3: scheduler must be linear, simple, beta, or beta57\n");
+    } else if (!strcasecmp(command, "shift")) {
+        if (!*argument) {
+            printf("Shift: %g\n", state->params.video_shift != 0.0 ?
+                   state->params.video_shift : H3_VIDEO_SIGMA_SHIFT);
+        } else {
+            char *end = NULL;
+            errno = 0;
+            double parsed = strtod(argument, &end);
+            if (errno || end == argument || *end ||
+                !(parsed >= H3_MIN_VIDEO_SIGMA_SHIFT &&
+                  parsed <= H3_MAX_VIDEO_SIGMA_SHIFT))
+                fprintf(stderr, "h3: shift must be %g to %g\n",
+                        H3_MIN_VIDEO_SIGMA_SHIFT, H3_MAX_VIDEO_SIGMA_SHIFT);
+            else
+                state->params.video_shift = parsed;
+        }
     } else if (!strcasecmp(command, "layers")) {
         set_integer(argument, "Layers", H3_MIN_DIT_LAYERS,
                     H3_DEFAULT_DIT_LAYERS, &state->params.dit_layers);

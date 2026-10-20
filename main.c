@@ -31,6 +31,7 @@ static void usage(const char *program) {
         "      --reuse N          Denoiser reuse: 1 close (default), 2 fast, 3 aggressive\n"
         "      --sampler S        Integrator: euler (default) or res\n"
         "      --scheduler S      Sigma grid: linear (default), simple, beta, beta57\n"
+        "      --shift F          Video sigma shift (default 12; audio stays 3)\n"
         "      --layers N         DiT blocks: 50 exact (default), 45 fast, 40 aggressive\n"
         "      --core-reuse N     Core refresh: 1 exact (default), 4 fast, 6 aggressive\n"
         "      --token-reduction  Pair video tokens in middle DiT blocks\n"
@@ -74,6 +75,20 @@ static int parse_int(const char *value, const char *label) {
         exit(2);
     }
     return (int)parsed;
+}
+
+static double parse_shift(const char *value, const char *label) {
+    char *end = NULL;
+    errno = 0;
+    double parsed = strtod(value, &end);
+    if (errno || !end || end == value || *end ||
+        !(parsed >= H3_MIN_VIDEO_SIGMA_SHIFT &&
+          parsed <= H3_MAX_VIDEO_SIGMA_SHIFT)) {
+        fprintf(stderr, "h3: invalid %s: %s (expected %g to %g)\n", label,
+                value, H3_MIN_VIDEO_SIGMA_SHIFT, H3_MAX_VIDEO_SIGMA_SHIFT);
+        exit(2);
+    }
+    return parsed;
 }
 
 static int parse_sampler(const char *value, const char *label) {
@@ -256,7 +271,7 @@ int main(int argc, char **argv) {
 
     enum { OPT_WIDTH = 1000, OPT_HEIGHT, OPT_RENDER_WIDTH, OPT_RENDER_HEIGHT,
            OPT_FRAMES, OPT_SECONDS, OPT_STEPS, OPT_REUSE,
-           OPT_SAMPLER, OPT_SCHEDULER,
+           OPT_SAMPLER, OPT_SCHEDULER, OPT_SHIFT,
            OPT_LAYERS,
            OPT_CORE_REUSE,
            OPT_TOKEN_REDUCTION,
@@ -293,6 +308,7 @@ int main(int argc, char **argv) {
         {"reuse", required_argument, NULL, OPT_REUSE},
         {"sampler", required_argument, NULL, OPT_SAMPLER},
         {"scheduler", required_argument, NULL, OPT_SCHEDULER},
+        {"shift", required_argument, NULL, OPT_SHIFT},
         {"layers", required_argument, NULL, OPT_LAYERS},
         {"core-reuse", required_argument, NULL, OPT_CORE_REUSE},
         {"token-reduction", no_argument, NULL, OPT_TOKEN_REDUCTION},
@@ -382,6 +398,9 @@ int main(int argc, char **argv) {
                 break;
             case OPT_SCHEDULER:
                 params.scheduler = parse_scheduler(optarg, "scheduler");
+                break;
+            case OPT_SHIFT:
+                params.video_shift = parse_shift(optarg, "shift");
                 break;
             case OPT_LAYERS:
                 params.dit_layers = parse_int(optarg, "layers");

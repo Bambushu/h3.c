@@ -151,13 +151,16 @@ typedef struct {
     /* Integrator and noise schedule; see h3_sampler / h3_scheduler. */
     int sampler;
     int scheduler;
+    /* Video sigma shift for the sampler grid. Zero selects the released
+     * H3_VIDEO_SIGMA_SHIFT (12); the audio shift is fixed at 3. */
+    double video_shift;
 } h3_params;
 
 #define H3_PARAMS_DEFAULT { \
     H3_DEFAULT_WIDTH, H3_DEFAULT_HEIGHT, H3_DEFAULT_FRAMES, H3_DEFAULT_STEPS, \
     UINT64_C(42), NULL, NULL, NULL, NULL, 0, H3_REFERENCE_IMAGE_MATCH, \
     1, H3_DEFAULT_DIT_LAYERS, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NULL, NULL, NULL, \
-    H3_SAMPLER_EULER, H3_SCHEDULER_LINEAR \
+    H3_SAMPLER_EULER, H3_SCHEDULER_LINEAR, 0.0 \
 }
 
 typedef struct {

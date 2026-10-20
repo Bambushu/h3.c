@@ -120,6 +120,14 @@ int h3_serving_schedule_build(int evaluations, h3_sigma_schedule *schedule);
 /* Same grid, with a selectable base schedule (h3_scheduler). */
 int h3_serving_schedule_build_ex(int evaluations, int scheduler,
                                  h3_sigma_schedule *schedule);
+/* Same grid and scheduler, with the video sigma shift as a parameter. The
+ * released grid is H3_VIDEO_SIGMA_SHIFT; adapters trained at another shift
+ * pass theirs. The audio shift stays H3_AUDIO_SIGMA_SHIFT. */
+#define H3_MIN_VIDEO_SIGMA_SHIFT 1.0
+#define H3_MAX_VIDEO_SIGMA_SHIFT 30.0
+int h3_serving_schedule_build_shifted(int evaluations, int scheduler,
+                                      double video_shift,
+                                      h3_sigma_schedule *schedule);
 
 int h3_layout_build(const h3_layout_spec *spec, h3_layout *layout,
                     char *error, size_t error_size);

@@ -132,6 +132,30 @@ static void test_schedule(void) {
     CHECK(close_enough(beta57_4.video[2], 0.8719390, 1e-6));
     CHECK(close_enough(beta57_4.video[3], 0.5631350, 1e-6));
     CHECK(!h3_serving_schedule_build_ex(4, 99, &beta4));
+    /* The video sigma shift is a parameter: 12 reproduces the released grid
+     * byte for byte, another shift moves the video grid and leaves audio. */
+    h3_sigma_schedule shift12, shift6, beta_shift6;
+    CHECK(h3_serving_schedule_build_shifted(8, H3_SCHEDULER_LINEAR, 12.0,
+                                            &shift12));
+    CHECK(h3_serving_schedule_build_shifted(8, H3_SCHEDULER_LINEAR, 6.0,
+                                            &shift6));
+    CHECK(h3_serving_schedule_build_shifted(8, H3_SCHEDULER_BETA57, 6.0,
+                                            &beta_shift6));
+    for (int index = 0; index <= 8; index++) {
+        CHECK(shift12.video[index] == linear.video[index]);
+        CHECK(shift12.audio[index] == linear.audio[index]);
+        CHECK(shift6.audio[index] == linear.audio[index]);
+    }
+    for (int index = 1; index < 8; index++) {
+        CHECK(shift6.video[index] < linear.video[index]);
+        CHECK(beta_shift6.video[index] < beta57.video[index]);
+    }
+    CHECK(shift6.video[0] == 1.0f && shift6.video[8] == 0.0f);
+    CHECK(beta_shift6.video[0] == 1.0f && beta_shift6.video[8] == 0.0f);
+    CHECK(!h3_serving_schedule_build_shifted(8, H3_SCHEDULER_LINEAR, 0.5,
+                                             &shift6));
+    CHECK(!h3_serving_schedule_build_shifted(8, H3_SCHEDULER_LINEAR, 31.0,
+                                             &shift6));
     double shifted = h3_time_shift_sigma(0.5, 12.0, 3.0);
     double back = h3_time_shift_sigma(shifted, 3.0, 12.0);
     CHECK(close_enough(back, 0.5, 1e-12));
