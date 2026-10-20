@@ -534,7 +534,7 @@ int h3_ffmpeg_write_rgb24(const char *path, const uint8_t *frames,
         "-f", "rawvideo", "-pixel_format", "rgb24",
         "-video_size", size, "-framerate", rate,
         "-i", "pipe:0", "-an", "-c:v", "libx264",
-        "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p",
+        "-preset", "slow", "-crf", "18", "-pix_fmt", "yuv420p",
         "-movflags", "+faststart", (char *)path, NULL
     };
     posix_spawn_file_actions_t actions;
@@ -683,7 +683,7 @@ static pid_t spawn_av_encoder(const char *path, int width, int height,
         "-f", "f32le", "-ar", audio_rate, "-ac", audio_channels,
         "-i", audio_input,
         "-map", "0:v:0", "-map", "1:a:0",
-        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+        "-c:v", "libx264", "-preset", "slow", "-crf", "18",
         "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
         "-movflags", "+faststart", (char *)path, NULL
     };
