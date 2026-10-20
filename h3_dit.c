@@ -2128,8 +2128,7 @@ static h3_dit *load_dit(h3_dit_core *core,
     if (!copy_layout(dit, layout, error, error_size) ||
         !validate_layout(dit, text, error, error_size) ||
         !configure_token_reduction(dit, token_reduction,
-                                   error, error_size) ||
-        !configure_sol_attention(dit, error, error_size)) goto failed;
+                                   error, error_size)) goto failed;
     size_t wanted_video_condition =
         (size_t)dit->video_condition_rows * VIDEO_PATCH;
     size_t wanted_audio_condition =
@@ -2162,6 +2161,8 @@ static h3_dit *load_dit(h3_dit_core *core,
     dit->use_int8_row_fc2 = dit->int8_mlp && use_int8_row_fc2;
     double opened = stream_now();
     report(progress, progress_opaque, "refine text", 0, 1);
+    /* After open_model: Sol-Attn needs the GPU context to probe its library. */
+    if (!configure_sol_attention(dit, error, error_size)) goto failed;
     if (!refine_text(dit, text, error, error_size)) goto failed;
     report(progress, progress_opaque, "refine text", 1, 1);
     double refined = stream_now();
