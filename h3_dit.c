@@ -2513,6 +2513,69 @@ static int leave_token_reduction_adaln(h3_dit *dit, unsigned block,
     return 1;
 }
 
+/* H3_DUMP_SOL_ATTENTION=<prefix> (with H3_DUMP_SOL_BLOCK / H3_DUMP_SOL_STEP):
+ * write the post-RoPE Q/K/V of one block at one step as raw BF16 and stop,
+ * so h3_sol_attention_bench can sweep tau on real activations. */
+static int capture_sol_attention(h3_dit *dit, unsigned block, int step,
+                                 uint32_t rows,
+                                 char *error, size_t error_size) {
+    const char *prefix = getenv("H3_DUMP_SOL_ATTENTION");
+    if (!prefix || !*prefix) return 1;
+    unsigned wanted_block = 0;
+    int wanted_step = 0;
+    const char *block_value = getenv("H3_DUMP_SOL_BLOCK");
+    const char *step_value = getenv("H3_DUMP_SOL_STEP");
+    if (block_value && *block_value)
+        wanted_block = (unsigned)strtoul(block_value, NULL, 10);
+    if (step_value && *step_value)
+        wanted_step = (int)strtol(step_value, NULL, 10);
+    if (block != wanted_block || step != wanted_step) return 1;
+    if (!h3_gpu_submit(dit->gpu)) {
+        fail(error, error_size, "cannot synchronize Sol-Attn capture: %s",
+             h3_gpu_error(dit->gpu));
+        return 0;
+    }
+    size_t elements = (size_t)rows * INNER;
+    uint16_t *host = malloc(elements * sizeof(*host));
+    if (!host) {
+        fail(error, error_size, "out of memory capturing Sol-Attn inputs");
+        return 0;
+    }
+    const h3_gpu_tensor *tensors[3] = {dit->query, dit->key, dit->value};
+    const char *suffixes[3] = {"q.bf16", "k.bf16", "v.bf16"};
+    char path[4096];
+    int ok = 1;
+    for (size_t slot = 0; slot < 3 && ok; slot++) {
+        int length = snprintf(path, sizeof(path), "%s.%s", prefix,
+                              suffixes[slot]);
+        if (length < 0 || (size_t)length >= sizeof(path) ||
+            !h3_gpu_tensor_read_bf16(tensors[slot], host, elements)) {
+            ok = 0;
+            break;
+        }
+        FILE *file = fopen(path, "wb");
+        if (!file || fwrite(host, sizeof(*host), elements, file) != elements)
+            ok = 0;
+        if (file && fclose(file) != 0) ok = 0;
+    }
+    free(host);
+    int length = snprintf(path, sizeof(path), "%s.json", prefix);
+    if (ok && length > 0 && (size_t)length < sizeof(path)) {
+        FILE *file = fopen(path, "w");
+        if (!file || fprintf(file,
+                "{\"tokens\":%u,\"heads\":%u,\"head_dim\":%u,"
+                "\"sink_tokens\":%u,\"block\":%u,\"step\":%d}\n",
+                rows, HEADS, HEAD_DIM, dit->video_target_start, block, step) < 0)
+            ok = 0;
+        if (file && fclose(file) != 0) ok = 0;
+    } else {
+        ok = 0;
+    }
+    fail(error, error_size, ok ? "Sol-Attn capture complete at %s" :
+         "cannot write Sol-Attn capture at %s", prefix);
+    return 0;
+}
+
 /* Sparse attention runs in the 20%-90% window of the schedule, the window
  * the published H3 SolAttn integration uses: the noisiest opening passes and
  * the final-detail pass stay dense. H3_SOL_ATTN_ALL_STEPS=1 removes the
@@ -2533,7 +2596,11 @@ static int use_sol_attention(const h3_dit *dit, int step) {
 static int report_sol_route_density(h3_dit *dit, unsigned block, int step,
                                     uint32_t rows,
                                     char *error, size_t error_size) {
-    if (!dit->sol_routes || dit->sol_routes_reported) return 1;
+    if (!dit->sol_routes) return 1;
+    /* Once per generation, on the first sparse step: blocks 0, 10, ... 40, 49. */
+    if (dit->sol_routes_reported && step != dit->sol_routes_reported - 1)
+        return 1;
+    if (block % 10 && block != H3_DIT_BLOCKS - 1) return 1;
     if (!h3_gpu_sol_attention_routes_bf16(
             dit->gpu, dit->sol_routes,
             dit->sol_query_centroids, dit->sol_key_centroids,
@@ -2562,7 +2629,7 @@ static int report_sol_route_density(h3_dit *dit, unsigned block, int step,
              h3_gpu_error(dit->gpu));
         return 0;
     }
-    dit->sol_routes_reported = 1;
+    dit->sol_routes_reported = step + 1;
     fprintf(stderr,
             "h3: Sol-Attn routes block=%u step=%d selected=%zu/%zu "
             "density=%.4f\n",
@@ -2621,6 +2688,8 @@ static int run_block(h3_dit *dit, unsigned index, int step,
         !dit->use_slower_row_major_attention_output &&
         !dit->use_slower_uncached_int8_scales &&
         !getenv("H3_DISABLE_HEAD_MAJOR_ATTENTION_OUTPUT");
+    if (!capture_sol_attention(dit, index, step, rows, error, error_size))
+        return 0;
     int sol_active = use_sol_attention(dit, step);
     if (sol_active)
         OP(h3_gpu_sol_attention_bf16(
