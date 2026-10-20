@@ -16,6 +16,10 @@ extern "C" {
 #define H3_DEFAULT_STEPS 20
 #define H3_DEFAULT_DIT_LAYERS 50
 #define H3_MIN_DIT_LAYERS 35
+#define H3_REFERENCE_AUDIO_RATE 32000
+#define H3_REFERENCE_AUDIO_MAX_SECONDS 45
+#define H3_REFERENCE_AUDIO_MAX_SAMPLES \
+    (H3_REFERENCE_AUDIO_RATE * H3_REFERENCE_AUDIO_MAX_SECONDS)
 
 typedef struct h3_ctx h3_ctx;
 typedef struct h3_result h3_result;

@@ -1,6 +1,7 @@
 #include "h3.h"
 #include "h3_cli.h"
 #include "h3_host.h"
+#include "h3_mutex.h"
 #include "h3_terminal.h"
 
 #include <errno.h>
@@ -551,9 +552,12 @@ int main(int argc, char **argv) {
         return 1;
     }
     if (profile) setenv("H3_PROFILE", "1", 1);
+    h3_mutex mutex;
+    if (!h3_mutex_acquire(&mutex)) return 1;
     h3_ctx *ctx = h3_load_dir(model_dir);
     if (!ctx) {
         fprintf(stderr, "h3: %s\n", h3_last_error(NULL));
+        h3_mutex_release(&mutex);
         return 1;
     }
     if (info) print_info(ctx);
@@ -579,6 +583,7 @@ int main(int argc, char **argv) {
             if (cli.active) fputc('\n', stderr);
             fprintf(stderr, "h3: %s\n", h3_last_error(ctx));
             h3_free(ctx);
+            h3_mutex_release(&mutex);
             return 1;
         }
         h3_result_free(result);
@@ -588,8 +593,10 @@ int main(int argc, char **argv) {
     } else if (!info) {
         int cli_status = h3_cli_run(ctx, model_dir, &params, show, seed_given);
         h3_free(ctx);
+        h3_mutex_release(&mutex);
         return cli_status;
     }
     h3_free(ctx);
+    h3_mutex_release(&mutex);
     return 0;
 }

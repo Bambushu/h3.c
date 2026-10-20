@@ -147,6 +147,13 @@ prompt with another seed avoids loading and encoding them again. Useful commands
 are `!status`, `!seed random`, `!seconds 2`, `!show`, `!save output.mp4`, and
 `!cache`. Use `!help` for the full, short list.
 
+The command-line executable serializes all H3 instances for the current user
+with a kernel-owned lock before Metal initialization. If another instance is
+active, the new instance reports the lock path while it waits. It also logs when
+the file lock is acquired and released. The lock is released by the kernel if
+the owner exits unexpectedly, so no stale PID-file cleanup is needed. This also
+applies to interactive sessions and keeps the lock until the session ends.
+
 First/last-frame conditioning is persistent in the session:
 
 ```text
@@ -514,8 +521,8 @@ the source's short edge exceeds 2048 pixels. Neither mode enlarges the source.
 
 Reference flags may be repeated and their command-line order is preserved.
 Standalone audio must accompany an image or video reference. Audio references
-must be 2–15 seconds; at most three audio inputs are accepted and their total
-decoded duration is capped at 15 seconds.
+must be 2–45 seconds; at most three audio inputs are accepted and their total
+decoded duration is capped at 45 seconds.
 
 ## Distilled sampling: fold the Turbo LoRA into the checkpoint
 
@@ -1009,8 +1016,8 @@ VAE's causal `ceil(T/4)` compression, two-frame Qwen sampling, and timestamped
 32 kHz stereo F32, encoded by the native AudioVAE posterior-mean path, mixed as
 0.999 clean latent plus 0.001 seeded noise, pinned to the audio condition
 timestep 1.0, and packed as width-32 rows on the same rotary timeline as visual
-references. Audio inputs are 2-15 seconds, at most three are
-accepted, their total decoded duration is capped at 15 seconds, and a standalone
+references. Audio inputs are 2-45 seconds, at most three are
+accepted, their total decoded duration is capped at 45 seconds, and a standalone
 audio reference must be combined with an image or video reference.
 
 The native audio encoder matches the corrected MLX oracle at relative L2

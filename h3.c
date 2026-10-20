@@ -625,7 +625,7 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
         h3_set_error(ctx, "full references cannot be combined with frame anchors");
         return 0;
     }
-    size_t images = 0, videos = 0, audio_inputs = 0, visual = 0;
+    size_t images = 0, videos = 0, audio_inputs = 0;
     for (size_t index = 0; index < params->reference_count; index++) {
         const h3_reference *reference = &params->references[index];
         if (!reference->path || !*reference->path) {
@@ -634,17 +634,17 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
         }
         switch (reference->kind) {
         case H3_REFERENCE_IMAGE:
-            images++; visual++;
+            images++;
             break;
         case H3_REFERENCE_VIDEO:
-            videos++; visual++;
+            videos++;
             if (reference->include_embedded_audio) audio_inputs++;
             break;
         case H3_REFERENCE_AUDIO:
             audio_inputs++;
             break;
         case H3_REFERENCE_VIDEO_AUDIO:
-            videos++; visual++; audio_inputs++;
+            videos++; audio_inputs++;
             if (!reference->audio_path || !*reference->audio_path) {
                 h3_set_error(ctx,
                     "video+audio reference %zu has no soundtrack path",
@@ -660,10 +660,6 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
     if (images > 9 || videos > 3 || audio_inputs > 3) {
         h3_set_error(ctx,
             "Ref2VA limits are 9 images, 3 videos, and 3 audio inputs");
-        return 0;
-    }
-    if (params->reference_count && !visual) {
-        h3_set_error(ctx, "reference audio requires an image or video reference");
         return 0;
     }
     return 1;
@@ -1321,7 +1317,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             const h3_reference *reference = &params->references[index];
             const char *audio_path = NULL;
             int truncate = 0;
-            int max_samples = 32000 * 15;
+            int max_samples = H3_REFERENCE_AUDIO_MAX_SAMPLES;
             if (reference->kind == H3_REFERENCE_AUDIO) {
                 audio_path = reference->path;
             } else if (reference->kind == H3_REFERENCE_VIDEO_AUDIO) {
@@ -1358,10 +1354,12 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
                 h3_set_error(ctx, "%s", detail);
                 goto cleanup;
             }
-            if ((size_t)samples > (size_t)32000 * 15 - total_audio_samples) {
+            if ((size_t)samples >
+                (size_t)H3_REFERENCE_AUDIO_MAX_SAMPLES - total_audio_samples) {
                 free(pcm);
                 h3_set_error(ctx,
-                    "ordered reference audio exceeds 15 seconds in total");
+                    "ordered reference audio exceeds %d seconds in total",
+                    H3_REFERENCE_AUDIO_MAX_SECONDS);
                 goto cleanup;
             }
             h3_audio_latent latent;

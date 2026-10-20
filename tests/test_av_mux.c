@@ -1,4 +1,5 @@
 #include "h3_ffmpeg.h"
+#include "h3.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -100,6 +101,21 @@ int main(int argc, char **argv) {
     if (left_energy < 1.0 || right_energy < 1.0)
         die("decoded FFmpeg audio has no stereo signal");
     free(decoded_pcm);
+    /* The reference-audio bound: a request at the 45-second limit is
+     * accepted (the AAC fixture is shorter and comes back whole, plus the
+     * codec's padding), one sample above it is refused before FFmpeg runs. */
+    decoded_pcm = NULL;
+    if (!h3_ffmpeg_read_audio_f32(path, H3_REFERENCE_AUDIO_MAX_SAMPLES, 1,
+                                  &decoded_pcm, &decoded_samples,
+                                  error, sizeof(error))) die(error);
+    if (decoded_samples < SAMPLES || decoded_samples > SAMPLES + 8192)
+        die("45-second reference-audio bound returned an unexpected sample count");
+    free(decoded_pcm);
+    decoded_pcm = NULL;
+    if (h3_ffmpeg_read_audio_f32(path, H3_REFERENCE_AUDIO_MAX_SAMPLES + 1, 1,
+                                 &decoded_pcm, &decoded_samples,
+                                 error, sizeof(error)))
+        die("reference audio accepted a request above the 45-second bound");
     printf("ok: concurrent FFmpeg video/PCM pipes created %s (%lld bytes)\n",
            path, (long long)status.st_size);
     free(rgb);
