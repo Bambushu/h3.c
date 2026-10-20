@@ -77,6 +77,59 @@ h3_dit *h3_dit_load_conditioned(
                          char *error, size_t error_size);
 void h3_dit_free(h3_dit *dit);
 
+/* H3_DIT_EARLY_LOAD: the prompt-independent half of a load (its own Metal
+ * context, the AdaLN schedule, gate-ranked layer selection and the persistent
+ * block weights), meant to run on a second thread while the prompt and anchors
+ * are encoded. visual_condition and audio_condition predict whether the
+ * packed layout will carry visual/audio condition rows. */
+typedef struct h3_dit_core h3_dit_core;
+h3_dit_core *h3_dit_core_load(const char *weight_directory,
+                              const char *shader_source_path,
+                              const h3_sigma_schedule *sigmas,
+                              unsigned active_blocks,
+                              int visual_condition, int audio_condition,
+                              int ssd_streaming,
+                              int use_slower_bf16_mlp,
+                              int use_slower_bf16_qkv,
+                              int use_slower_bf16_attention_output,
+                              char *error, size_t error_size);
+void h3_dit_core_free(h3_dit_core *core);
+
+/* As h3_dit_load_conditioned (NULL/0 condition rows for text-only), finishing
+ * the prompt-dependent half on top of core. The core is always consumed; if
+ * it was prepared for a different request (weights, steps, layers, condition
+ * kinds, BF16 switches) it is released and the load runs serially. core may
+ * be NULL. */
+h3_dit *h3_dit_load_with_core(
+                         h3_dit_core *core,
+                         const char *weight_directory,
+                         const char *shader_source_path,
+                         const h3_text_embedding *text,
+                         const h3_layout *layout,
+                         const h3_sigma_schedule *sigmas,
+                         unsigned active_blocks,
+                         unsigned core_reuse_interval,
+                         int token_reduction,
+                         int ssd_streaming,
+                         float spatial_rope_scale,
+                         int use_slower_bf16_mlp,
+                         int use_slower_bf16_qkv,
+                         int use_slower_bf16_attention_output,
+                         int use_slower_row_major_attention_output,
+                         int use_slower_unfused_int8_inputs,
+                         int use_slower_unfused_qkv_rope,
+                         int use_slower_scalar_qkv_rms,
+                         int use_slower_uncached_int8_scales,
+                         int use_slower_dynamic_fc1_k,
+                         int use_slower_grouped_quantizer,
+                         int use_int8_row_fc2,
+                         const float *condition_video_rows,
+                         size_t condition_video_elements,
+                         const float *condition_audio_rows,
+                         size_t condition_audio_elements,
+                         h3_dit_progress progress, void *progress_opaque,
+                         char *error, size_t error_size);
+
 /* Reset mutable sampler state and replace seed-dependent condition rows before
  * reusing an otherwise identical prepared transformer. */
 int h3_dit_reset_run(h3_dit *dit,

@@ -28,9 +28,9 @@ static void usage(const char *program) {
         "      --frames N         Requested frames (default: 56)\n"
         "      --seconds N        Requested duration at 24 fps (instead of --frames)\n"
         "      --steps N          Denoising passes (default: 20)\n"
-        "      --reuse N          Denoiser reuse: 1 close, 2 fast, 3 aggressive\n"
-        "      --layers N         DiT blocks: 50 exact, 45 fast, 40 aggressive\n"
-        "      --core-reuse N     Core refresh: 1 exact, 4 fast, 6 aggressive\n"
+        "      --reuse N          Denoiser reuse: 1 close (default), 2 fast, 3 aggressive\n"
+        "      --layers N         DiT blocks: 50 exact (default), 45 fast, 40 aggressive\n"
+        "      --core-reuse N     Core refresh: 1 exact (default), 4 fast, 6 aggressive\n"
         "      --token-reduction  Pair video tokens in middle DiT blocks\n"
         "      --ssd-streaming    Stream original BF16 DiT layers from SSD\n"
         "      --use-int8-row-fc2 Faster one-scale int8 FC2 (M5)\n"
@@ -55,7 +55,7 @@ static void usage(const char *program) {
         "      --ref-video-audio VIDEO AUDIO  Append video + soundtrack\n"
         "      --ref-audio PATH    Append an ordered standalone audio clip\n"
         "      --frames-dir PATH  Write generated frames as PPM files\n"
-        "      --show             Display a frame after every denoising step (M5)\n"
+        "      --show             Display a frame after every denoising step\n"
         "      --zoom N           Terminal image zoom (default: 2 for Retina)\n"
         "      --profile          Print per-phase Metal timing and allocation data\n"
         "      --info             Inspect model/device without mapping weights\n"
@@ -229,6 +229,10 @@ static int cli_frame(const h3_frame *frame, void *opaque) {
 }
 
 int main(int argc, char **argv) {
+    /* Line-buffer stdout so Done/status lines flush immediately when
+     * stdout is a pipe (non-TTY). See antirez/h3.c#25. */
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
     enum { OPT_WIDTH = 1000, OPT_HEIGHT, OPT_RENDER_WIDTH, OPT_RENDER_HEIGHT,
            OPT_FRAMES, OPT_SECONDS, OPT_STEPS, OPT_REUSE,
            OPT_LAYERS,
@@ -251,7 +255,8 @@ int main(int argc, char **argv) {
            OPT_FIRST, OPT_LAST, OPT_REF_IMAGE, OPT_REF_IMAGE_SIZE,
            OPT_REF_VIDEO, OPT_REF_SILENT_VIDEO, OPT_REF_VIDEO_AUDIO,
            OPT_REF_AUDIO, OPT_FRAMES_DIR, OPT_SHOW, OPT_ZOOM,
-           OPT_PROFILE, OPT_INFO };
+           OPT_PROFILE, OPT_INFO,
+           OPT_SDPA_QUERY_BLOCK };
     static const struct option options[] = {
         {"model-dir", required_argument, NULL, 'd'},
         {"prompt", required_argument, NULL, 'p'},
@@ -268,6 +273,7 @@ int main(int argc, char **argv) {
         {"core-reuse", required_argument, NULL, OPT_CORE_REUSE},
         {"token-reduction", no_argument, NULL, OPT_TOKEN_REDUCTION},
         {"ssd-streaming", no_argument, NULL, OPT_SSD_STREAMING},
+        {"sdpa-query-block", required_argument, NULL, OPT_SDPA_QUERY_BLOCK},
         {"use-int8-row-fc2", no_argument, NULL, OPT_USE_INT8_ROW_FC2},
         {"use-reference-rope", no_argument, NULL, OPT_USE_REFERENCE_ROPE},
         {"use-slower-bf16-mlp", no_argument, NULL,
@@ -355,6 +361,15 @@ int main(int argc, char **argv) {
                 break;
             case OPT_TOKEN_REDUCTION: params.token_reduction = 1; break;
             case OPT_SSD_STREAMING: params.ssd_streaming = 1; break;
+            case OPT_SDPA_QUERY_BLOCK: {
+                /* Sets H3_SDPA_MAX_QUERY_ROWS for the Ultra SDPA workaround (#16). */
+                int rows = parse_int(optarg, "sdpa query block");
+                if (rows < 0) return 1;
+                char buf[32];
+                snprintf(buf, sizeof(buf), "%d", rows);
+                setenv("H3_SDPA_MAX_QUERY_ROWS", buf, 1);
+                break;
+            }
             case OPT_USE_INT8_ROW_FC2:
                 params.use_int8_row_fc2 = 1;
                 break;

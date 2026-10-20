@@ -13,12 +13,14 @@
 #include "h3_vision_encoder.h"
 
 #include <errno.h>
+#include <pthread.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 
 static char h3_global_error[512];
 
@@ -511,7 +513,8 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
             return 0;
         }
     }
-    if (params->frames < 5 || h3_align_frame_count(params->frames) > 362) {
+    int aligned_frames = h3_align_frame_count(params->frames);
+    if (params->frames < 5 || !aligned_frames || aligned_frames > 362) {
         h3_set_error(ctx, "frames must align within the released 5..362 range");
         return 0;
     }
@@ -718,20 +721,157 @@ static h3_video_vae_decoder *h3_acquire_video_decoder(
     return decoder;
 }
 
+/* H3_VAE_PREFETCH=1: load the resident video VAE decoder on a second thread
+ * while the DiT denoises, so its weight read overlaps GPU work instead of
+ * following it. The decoder is handed to the normal decoder cache after the
+ * denoise; on any failure the serial load below runs as before. */
+typedef struct {
+    const char *weight_directory;
+    int latent_h;
+    int latent_w;
+    h3_video_vae_decoder *decoder;
+    char error[512];
+} h3_vae_prefetch;
+
+static void *h3_vae_prefetch_run(void *opaque) {
+    h3_vae_prefetch *job = opaque;
+    job->decoder = h3_video_vae_decoder_load(
+        job->weight_directory, "h3_shaders.metal", job->latent_h,
+        job->latent_w, NULL, NULL, job->error, sizeof(job->error));
+    return NULL;
+}
+
+static double h3_seconds(void);
+
+static void *h3_dit_free_run(void *opaque) {
+    double started = h3_seconds();
+    h3_dit_free(opaque);
+    if (getenv("H3_PROFILE"))
+        fprintf(stderr, "h3 profile: DiT free wall=%.3fs (overlapped with "
+                "the VAEs)\n", h3_seconds() - started);
+    return NULL;
+}
+
+/* H3_DIT_EARLY_LOAD=1: load the prompt-independent DiT half (its Metal
+ * context, the AdaLN schedule and the persistent block weights) on a second
+ * thread while the anchors and prompt are encoded. The DiT load adopts it only
+ * for exactly the request it was prepared for; on any failure or mismatch the
+ * serial load below runs as before. */
+typedef struct {
+    const char *weight_directory;
+    h3_sigma_schedule sigmas;
+    unsigned active_blocks;
+    int visual_condition;
+    int audio_condition;
+    int ssd_streaming;
+    int use_slower_bf16_mlp;
+    int use_slower_bf16_qkv;
+    int use_slower_bf16_attention_output;
+    h3_dit_core *core;
+    char error[512];
+} h3_dit_early_load;
+
+static void *h3_dit_early_load_run(void *opaque) {
+    h3_dit_early_load *job = opaque;
+    job->core = h3_dit_core_load(
+        job->weight_directory, "h3_shaders.metal", &job->sigmas,
+        job->active_blocks, job->visual_condition, job->audio_condition,
+        job->ssd_streaming, job->use_slower_bf16_mlp,
+        job->use_slower_bf16_qkv, job->use_slower_bf16_attention_output,
+        job->error, sizeof(job->error));
+    return NULL;
+}
+
+/* Whether the packed layout will carry visual and audio condition rows. A
+ * wrong guess only costs the early load: the DiT load then runs serially. */
+static void h3_predict_conditions(const h3_params *params, int ref2va,
+                                  int *visual, int *audio) {
+    *visual = !ref2va && (params->first_frame || params->last_frame);
+    *audio = 0;
+    for (size_t index = 0; ref2va && index < params->reference_count;
+         index++) {
+        const h3_reference *reference = &params->references[index];
+        if (reference->kind != H3_REFERENCE_AUDIO) *visual = 1;
+        if (reference->kind == H3_REFERENCE_AUDIO ||
+            reference->kind == H3_REFERENCE_VIDEO_AUDIO ||
+            (reference->kind == H3_REFERENCE_VIDEO &&
+             reference->include_embedded_audio)) *audio = 1;
+    }
+}
+
+static double h3_seconds(void) {
+    struct timespec value;
+    if (clock_gettime(CLOCK_MONOTONIC, &value) != 0) return 0.0;
+    return (double)value.tv_sec + (double)value.tv_nsec * 1e-9;
+}
+
 static void h3_vision_progress_bridge(int completed, int total, void *opaque) {
     h3_progress_emit(opaque, "Qwen vision", completed, total);
 }
 
-static uint8_t *h3_rgb_f32_to_u8(const float *rgb, size_t count) {
-    uint8_t *output = malloc(count);
-    if (!output) return NULL;
+static void h3_rgb_f32_to_u8_into(uint8_t *output, const float *rgb,
+                                  size_t count) {
     for (size_t index = 0; index < count; index++) {
         float scaled = rgb[index] * 255.0f;
         if (scaled < 0.0f) scaled = 0.0f;
         if (scaled > 255.0f) scaled = 255.0f;
         output[index] = (uint8_t)lrintf(scaled);
     }
+}
+
+static uint8_t *h3_rgb_f32_to_u8(const float *rgb, size_t count) {
+    uint8_t *output = malloc(count);
+    if (!output) return NULL;
+    h3_rgb_f32_to_u8_into(output, rgb, count);
     return output;
+}
+
+/* Streamed output: each chunk of decoded frames is converted (and resized
+ * when an internal canvas is used) into its slot of the final RGB24 video
+ * the moment the VAE finishes it, then handed to the running FFmpeg. The
+ * per-element conversion and per-frame resize are the ones the whole-video
+ * path applies afterwards, so the bytes are identical. */
+typedef struct {
+    uint8_t *rgb8;
+    int frames;
+    int width;
+    int height;
+    h3_ffmpeg_av_stream *stream;
+    double convert_seconds;
+    int failed;
+} h3_frame_delivery;
+
+static int h3_deliver_decoded_frames(const float *rgb, int first, int count,
+                                     int width, int height, void *opaque) {
+    h3_frame_delivery *delivery = opaque;
+    double started = h3_seconds();
+    if (first < 0 || count < 1 || first > delivery->frames - count) {
+        delivery->failed = 1;
+        return 0;
+    }
+    size_t output_frame = (size_t)delivery->width * (size_t)delivery->height *
+                          3;
+    uint8_t *destination = delivery->rgb8 + (size_t)first * output_frame;
+    size_t decoded = (size_t)count * (size_t)width * (size_t)height * 3;
+    if (width == delivery->width && height == delivery->height) {
+        h3_rgb_f32_to_u8_into(destination, rgb, decoded);
+    } else {
+        uint8_t *native = h3_rgb_f32_to_u8(rgb, decoded);
+        uint8_t *resized = NULL;
+        int ok = native && h3_resize_rgb24_high_quality(
+            native, count, width, height, delivery->width, delivery->height,
+            &resized);
+        if (ok) memcpy(destination, resized, (size_t)count * output_frame);
+        free(native);
+        free(resized);
+        if (!ok) {
+            delivery->failed = 1;
+            return 0;
+        }
+    }
+    h3_ffmpeg_av_stream_ready(delivery->stream, first + count);
+    delivery->convert_seconds += h3_seconds() - started;
+    return 1;
 }
 
 typedef struct {
@@ -893,6 +1033,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     int keyframes[2] = {0, 0};
     size_t keyframe_count = 0;
     float *condition_video_rows = NULL;
+    h3_video_encoder *video_encoder = NULL;
     size_t condition_video_elements = 0;
     float *condition_audio_rows = NULL;
     size_t condition_audio_elements = 0;
@@ -902,6 +1043,16 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     memset(&layout, 0, sizeof(layout));
     h3_dit *dit = NULL;
     h3_video_vae_decoder *preview_decoder = NULL;
+    h3_vae_prefetch prefetch;
+    memset(&prefetch, 0, sizeof(prefetch));
+    pthread_t prefetch_thread;
+    int prefetching = 0;
+    h3_dit_early_load early;
+    memset(&early, 0, sizeof(early));
+    pthread_t early_thread;
+    int early_loading = 0;
+    pthread_t dit_free_thread;
+    int dit_freeing = 0;
     h3_live_preview live_preview;
     memset(&live_preview, 0, sizeof(live_preview));
     float *video = NULL, *audio = NULL;
@@ -910,6 +1061,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     h3_audio_waveform waveform;
     memset(&waveform, 0, sizeof(waveform));
     uint8_t *rgb8 = NULL;
+    h3_ffmpeg_av_stream *output_stream = NULL;
     h3_result *result = NULL;
     char *conditioning_key = NULL;
     char *prepared_key = NULL;
@@ -965,6 +1117,23 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         ctx->dit = NULL;
         free(ctx->dit_key);
         ctx->dit_key = NULL;
+    }
+    const char *early_flag = getenv("H3_DIT_EARLY_LOAD");
+    if (early_flag && *early_flag && strcmp(early_flag, "0") &&
+        !(ctx->cache_enabled && ctx->dit && ctx->dit_key &&
+          !strcmp(ctx->dit_key, prepared_key)) &&
+        h3_serving_schedule_build(params->steps, &early.sigmas)) {
+        early.weight_directory = dit_path;
+        early.active_blocks = (unsigned)params->dit_layers;
+        h3_predict_conditions(params, ref2va, &early.visual_condition,
+                              &early.audio_condition);
+        early.ssd_streaming = params->ssd_streaming;
+        early.use_slower_bf16_mlp = params->use_slower_bf16_mlp;
+        early.use_slower_bf16_qkv = params->use_slower_bf16_qkv;
+        early.use_slower_bf16_attention_output =
+            params->use_slower_bf16_attention_output;
+        early_loading = !pthread_create(&early_thread, NULL,
+                                        h3_dit_early_load_run, &early);
     }
     conditioning_hit = ctx->cache_enabled && ctx->conditioning_key &&
         !strcmp(ctx->conditioning_key, conditioning_key);
@@ -1286,6 +1455,13 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             h3_set_error(ctx, "out of memory allocating visual condition rows");
             goto cleanup;
         }
+        /* One Metal context, weight load and graph set for every anchor. */
+        video_encoder = h3_video_encoder_open(vae_path, "h3_shaders.metal",
+                                              detail, sizeof(detail));
+        if (!video_encoder) {
+            h3_set_error(ctx, "%s", detail);
+            goto cleanup;
+        }
         size_t condition_offset = 0;
         for (size_t image = 0; image < visual_count; image++) {
             int image_latent_w, image_latent_h;
@@ -1298,8 +1474,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
                                   (size_t)image_latent_w / 4 * 96;
             h3_video_latent latent;
             memset(&latent, 0, sizeof(latent));
-            if (!h3_video_vae_encode(
-                    vae_path, "h3_shaders.metal", condition_pixels[image],
+            if (!h3_video_encoder_encode(
+                    video_encoder, condition_pixels[image],
                     condition_frames[image], condition_heights[image],
                     condition_widths[image],
                     h3_video_encoder_progress_bridge, &progress,
@@ -1329,6 +1505,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             condition_offset += row_elements;
             if (progress.cancelled) goto cleanup;
         }
+        h3_video_encoder_free(video_encoder);
+        video_encoder = NULL;
         if (condition_offset != condition_video_elements) {
             h3_set_error(ctx, "visual condition packing size mismatch");
             goto cleanup;
@@ -1462,6 +1640,17 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     }
     float spatial_rope_scale = !params->use_reference_rope &&
         render_width == 256 && render_height == 256 ? 0.5f : 1.0f;
+    if (early_loading) {
+        double join_started = h3_seconds();
+        pthread_join(early_thread, NULL);
+        early_loading = 0;
+        if (!early.core)
+            fprintf(stderr, "h3: warning: DiT early load failed: %s\n",
+                    early.error);
+        if (getenv("H3_PROFILE"))
+            fprintf(stderr, "h3 profile: DiT early load join wait=%.3fs\n",
+                    h3_seconds() - join_started);
+    }
     if (ctx->cache_enabled && ctx->dit && ctx->dit_key &&
         !strcmp(ctx->dit_key, prepared_key)) {
         dit = ctx->dit;
@@ -1474,6 +1663,29 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             goto cleanup;
         }
         fprintf(stderr, "h3: prepared DiT cache hit\n");
+    } else if (early.core) {
+        h3_dit_core *core = early.core;
+        early.core = NULL;
+        dit = h3_dit_load_with_core(
+            core, dit_path, "h3_shaders.metal", &text, &layout, &sigmas,
+            (unsigned)params->dit_layers, (unsigned)params->core_reuse,
+            params->token_reduction,
+            params->ssd_streaming,
+            spatial_rope_scale,
+            params->use_slower_bf16_mlp,
+            params->use_slower_bf16_qkv,
+            params->use_slower_bf16_attention_output,
+            params->use_slower_row_major_attention_output,
+            params->use_slower_unfused_int8_inputs,
+            params->use_slower_unfused_qkv_rope,
+            params->use_slower_scalar_qkv_rms,
+            params->use_slower_uncached_int8_scales,
+            params->use_slower_dynamic_fc1_k,
+            params->use_slower_grouped_quantizer,
+            params->use_int8_row_fc2,
+            condition_video_rows, condition_video_elements,
+            condition_audio_rows, condition_audio_elements,
+            h3_dit_progress_bridge, &progress, detail, sizeof(detail));
     } else if (conditioned) {
         dit = h3_dit_load_conditioned(
             dit_path, "h3_shaders.metal", &text, &layout, &sigmas,
@@ -1573,12 +1785,33 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     h3_rng_seed(&audio_rng, params->seed);
     h3_rng_fill_normal(&video_rng, video, video_count);
     h3_rng_fill_normal(&audio_rng, audio, audio_count);
-    if (!h3_dit_denoise_euler_preview(
+    const char *prefetch_flag = getenv("H3_VAE_PREFETCH");
+    if (!preview_decoder && prefetch_flag &&
+        *prefetch_flag && strcmp(prefetch_flag, "0") &&
+        !(ctx->video_decoder && ctx->video_decoder_key &&
+          !strcmp(ctx->video_decoder_key, decoder_key))) {
+        prefetch.weight_directory = vae_path;
+        prefetch.latent_h = latent_h;
+        prefetch.latent_w = latent_w;
+        prefetching = !pthread_create(&prefetch_thread, NULL,
+                                      h3_vae_prefetch_run, &prefetch);
+    }
+    int denoise_ok = h3_dit_denoise_euler_preview(
             dit, video, audio, params->denoise_reuse,
             h3_dit_progress_bridge, &progress,
             preview_decoder ? h3_deliver_denoise_preview : NULL,
             preview_decoder ? &live_preview : NULL,
-            detail, sizeof(detail))) {
+            detail, sizeof(detail));
+    double tail_started = h3_seconds();
+    if (prefetching) {
+        pthread_join(prefetch_thread, NULL);
+        prefetching = 0;
+        if (!prefetch.decoder)
+            fprintf(stderr, "h3: warning: video VAE prefetch failed: %s\n",
+                    prefetch.error);
+    }
+    double prefetch_joined = h3_seconds();
+    if (!denoise_ok) {
         if (!live_preview.failed) h3_set_error(ctx, "%s", detail);
         if (dit_is_cached) {
             ctx->dit = NULL;
@@ -1588,9 +1821,31 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         }
         goto cleanup;
     }
-    if (!dit_is_cached) h3_dit_free(dit);
+    /* Pipelined decode: tear the single-use DiT down (about 23 GiB of Metal
+     * buffers and cache mappings) on a second thread while the VAEs run; it
+     * computes nothing, so the output is unchanged. Joined at cleanup. */
+    if (!dit_is_cached) {
+        dit_freeing = h3_video_vae_pipelined() &&
+            !pthread_create(&dit_free_thread, NULL, h3_dit_free_run, dit);
+        if (!dit_freeing) h3_dit_free(dit);
+    }
     dit = NULL;
+    double dit_freed = h3_seconds();
     if (progress.cancelled) goto cleanup;
+    /* Diagnostic: save the normalized video latent so tools/vae_bench can
+     * replay the VAE decode alone. Layout: int32 t,h,w then F32 [24,t,h,w]. */
+    const char *dump_path = getenv("H3_DUMP_VIDEO_LATENT");
+    if (dump_path && *dump_path) {
+        FILE *dump = fopen(dump_path, "wb");
+        int32_t dims[3] = {temporal.video_t, latent_h, latent_w};
+        size_t count = (size_t)24 * (size_t)temporal.video_t *
+                       (size_t)latent_h * (size_t)latent_w;
+        if (!dump || fwrite(dims, sizeof(dims), 1, dump) != 1 ||
+            fwrite(video, sizeof(*video), count, dump) != count)
+            fprintf(stderr, "h3: cannot write %s\n", dump_path);
+        if (dump) fclose(dump);
+    }
+    double audio_started = h3_seconds();
     h3_progress_emit(&progress, "audio VAE", 0, 7);
     if (!h3_audio_vae_decode(audio_vae_path, "h3_shaders.metal", audio,
                              temporal.audio_t, h3_audio_vae_progress_bridge,
@@ -1601,6 +1856,27 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     free(audio);
     audio = NULL;
     if (progress.cancelled) goto cleanup;
+    double audio_finished = h3_seconds();
+    if (!preview_decoder && !ctx->cache_enabled && prefetch.decoder) {
+        /* Single-shot run: use the prefetched decoder once, freed below. */
+        preview_decoder = prefetch.decoder;
+        decoder_is_cached = 0;
+        prefetch.decoder = NULL;
+        fprintf(stderr, "h3: video VAE prefetched during denoise\n");
+    }
+    if (!preview_decoder && ctx->cache_enabled && prefetch.decoder) {
+        char *key_copy = strdup(decoder_key);
+        if (key_copy) {
+            h3_video_vae_decoder_free(ctx->video_decoder);
+            free(ctx->video_decoder_key);
+            ctx->video_decoder = prefetch.decoder;
+            ctx->video_decoder_key = key_copy;
+            preview_decoder = prefetch.decoder;
+            decoder_is_cached = 1;
+            prefetch.decoder = NULL;
+            fprintf(stderr, "h3: video VAE prefetched during denoise\n");
+        }
+    }
     if (!preview_decoder && ctx->cache_enabled) {
         h3_progress_emit(&progress, "video VAE load", 0, 36);
         preview_decoder = h3_acquire_video_decoder(
@@ -1614,50 +1890,106 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             goto cleanup;
         }
     }
-    int video_ok = preview_decoder ?
-        h3_video_vae_decoder_decode(
-            preview_decoder, video, temporal.video_t, &frames,
-            detail, sizeof(detail)) :
-        h3_video_vae_decode(
-            vae_path, "h3_shaders.metal", video,
-            temporal.video_t, latent_h, latent_w,
-            h3_vae_progress_bridge, &progress, &frames,
-            detail, sizeof(detail));
-    if (!video_ok) {
-        h3_set_error(ctx, "%s", detail);
-        goto cleanup;
-    }
-    free(video);
-    video = NULL;
-    if (progress.cancelled) goto cleanup;
-    size_t rgb_count = (size_t)frames.frames * (size_t)frames.height *
-                       (size_t)frames.width * 3;
-    rgb8 = h3_rgb_f32_to_u8(frames.rgb, rgb_count);
-    if (!rgb8) {
-        h3_set_error(ctx, "out of memory converting generated RGB frames");
-        goto cleanup;
-    }
-    int output_width = frames.width;
-    int output_height = frames.height;
-    if (output_width != params->width || output_height != params->height) {
-        uint8_t *resized = NULL;
-        if (!h3_resize_rgb24_high_quality(
-                rgb8, frames.frames, output_width, output_height,
-                params->width, params->height, &resized)) {
-            h3_set_error(ctx, "cannot resize generated RGB frames");
-            goto cleanup;
-        }
-        free(rgb8);
-        rgb8 = resized;
+    /* With a resident decoder, frames stream from the VAE straight into the
+     * final RGB24 video and an FFmpeg started before the decode, so the
+     * conversion and H.264 encode overlap the remaining tiles (the frame
+     * and file bytes are those of the whole-video hand-off below, which
+     * H3_VAE_DECODE_LEGACY=1 restores). */
+    int streamed = preview_decoder && h3_video_vae_pipelined();
+    int frame_count = 0, output_width = 0, output_height = 0;
+    double decode_started = h3_seconds(), decoded_at = 0.0;
+    double convert_seconds = 0.0, ffmpeg_open_seconds = 0.0;
+    if (streamed) {
+        frame_count = (temporal.video_t - 2) / 5 * 17 + 5;
         output_width = params->width;
         output_height = params->height;
+        rgb8 = malloc((size_t)frame_count * (size_t)output_width *
+                      (size_t)output_height * 3);
+        if (!rgb8) {
+            h3_set_error(ctx, "out of memory converting generated RGB frames");
+            goto cleanup;
+        }
+        h3_frame_delivery delivery = {
+            rgb8, frame_count, output_width, output_height, NULL, 0.0, 0
+        };
+        if (params->output_path && *params->output_path) {
+            output_stream = h3_ffmpeg_av_stream_open(
+                params->output_path, rgb8, frame_count, output_width,
+                output_height, H3_FPS, waveform.pcm, waveform.samples,
+                waveform.channels, waveform.sample_rate,
+                detail, sizeof(detail));
+            if (!output_stream) {
+                h3_set_error(ctx, "%s", detail);
+                goto cleanup;
+            }
+            delivery.stream = output_stream;
+            ffmpeg_open_seconds = h3_seconds() - decode_started;
+            decode_started = h3_seconds();
+        }
+        if (!h3_video_vae_decoder_decode_stream(
+                preview_decoder, video, temporal.video_t,
+                h3_deliver_decoded_frames, &delivery,
+                detail, sizeof(detail))) {
+            if (delivery.failed)
+                h3_set_error(ctx, "cannot convert generated RGB frames");
+            else
+                h3_set_error(ctx, "%s", detail);
+            goto cleanup;
+        }
+        decoded_at = h3_seconds();
+        convert_seconds = delivery.convert_seconds;
+        free(video);
+        video = NULL;
+        if (progress.cancelled) goto cleanup;
+    } else {
+        int video_ok = preview_decoder ?
+            h3_video_vae_decoder_decode(
+                preview_decoder, video, temporal.video_t, &frames,
+                detail, sizeof(detail)) :
+            h3_video_vae_decode(
+                vae_path, "h3_shaders.metal", video,
+                temporal.video_t, latent_h, latent_w,
+                h3_vae_progress_bridge, &progress, &frames,
+                detail, sizeof(detail));
+        if (!video_ok) {
+            h3_set_error(ctx, "%s", detail);
+            goto cleanup;
+        }
+        decoded_at = h3_seconds();
+        free(video);
+        video = NULL;
+        if (progress.cancelled) goto cleanup;
+        size_t rgb_count = (size_t)frames.frames * (size_t)frames.height *
+                           (size_t)frames.width * 3;
+        rgb8 = h3_rgb_f32_to_u8(frames.rgb, rgb_count);
+        if (!rgb8) {
+            h3_set_error(ctx, "out of memory converting generated RGB frames");
+            goto cleanup;
+        }
+        frame_count = frames.frames;
+        output_width = frames.width;
+        output_height = frames.height;
+        if (output_width != params->width || output_height != params->height) {
+            uint8_t *resized = NULL;
+            if (!h3_resize_rgb24_high_quality(
+                    rgb8, frames.frames, output_width, output_height,
+                    params->width, params->height, &resized)) {
+                h3_set_error(ctx, "cannot resize generated RGB frames");
+                goto cleanup;
+            }
+            free(rgb8);
+            rgb8 = resized;
+            output_width = params->width;
+            output_height = params->height;
+        }
+        convert_seconds = h3_seconds() - decoded_at;
     }
     if (params->on_frame) {
         size_t frame_bytes = (size_t)output_width * (size_t)output_height * 3;
-        for (int index = 0; index < frames.frames; index++) {
+        for (int index = 0; index < frame_count; index++) {
             h3_frame frame = {output_width, output_height, output_width * 3,
                               rgb8 + (size_t)index * frame_bytes,
-                              index, frames.frames, -1, 0};
+                              index, frame_count, -1, 0};
             if (params->on_frame(&frame, params->callback_opaque)) {
                 h3_set_error(ctx, "generation cancelled while delivering frame %d",
                              index);
@@ -1665,17 +1997,41 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             }
         }
     }
+    double ffmpeg_started = h3_seconds();
     if (params->output_path && *params->output_path) {
-        h3_progress_emit(&progress, "FFmpeg", 0, frames.frames);
-        if (!h3_ffmpeg_write_av_rgb24_f32(
-                params->output_path, rgb8, frames.frames, output_width,
+        h3_progress_emit(&progress, "FFmpeg", 0, frame_count);
+        int written;
+        if (output_stream) {
+            h3_ffmpeg_av_stream *stream = output_stream;
+            output_stream = NULL;
+            written = h3_ffmpeg_av_stream_finish(stream, detail,
+                                                 sizeof(detail));
+        } else {
+            written = h3_ffmpeg_write_av_rgb24_f32(
+                params->output_path, rgb8, frame_count, output_width,
                 output_height, H3_FPS, waveform.pcm, waveform.samples,
                 waveform.channels, waveform.sample_rate,
-                detail, sizeof(detail))) {
+                detail, sizeof(detail));
+        }
+        if (!written) {
             h3_set_error(ctx, "%s", detail);
             goto cleanup;
         }
-        h3_progress_emit(&progress, "FFmpeg", frames.frames, frames.frames);
+        h3_progress_emit(&progress, "FFmpeg", frame_count, frame_count);
+    }
+    if (getenv("H3_PROFILE")) {
+        double finished = h3_seconds();
+        fprintf(stderr, "h3 profile: output tail %s wall=%.3fs "
+                "prefetch-join=%.3fs dit-free=%.3fs latent-dump=%.3fs "
+                "audio-vae=%.3fs decoder-acquire=%.3fs ffmpeg-start=%.3fs "
+                "video-decode=%.3fs rgb8=%.3fs%s ffmpeg-finish=%.3fs\n",
+                streamed ? "streamed" : "legacy", finished - tail_started,
+                prefetch_joined - tail_started, dit_freed - prefetch_joined,
+                audio_started - dit_freed, audio_finished - audio_started,
+                decode_started - audio_finished - ffmpeg_open_seconds,
+                ffmpeg_open_seconds, decoded_at - decode_started,
+                convert_seconds, streamed ? " (inside decode)" : "",
+                finished - ffmpeg_started);
     }
     result = calloc(1, sizeof(*result));
     if (!result) {
@@ -1684,12 +2040,18 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     }
     result->width = output_width;
     result->height = output_height;
-    result->frames = frames.frames;
+    result->frames = frame_count;
     result->fps = H3_FPS;
     result->sample_rate = waveform.sample_rate;
     result->seed = params->seed;
 
 cleanup:
+    /* The early loader reads dit_path, so it is joined before any free. */
+    if (early_loading) pthread_join(early_thread, NULL);
+    if (dit_freeing) pthread_join(dit_free_thread, NULL);
+    /* Before rgb8 is freed: the FFmpeg feeder reads it until stopped. */
+    h3_ffmpeg_av_stream_abort(output_stream);
+    h3_dit_core_free(early.core);
     free(conditioning_key);
     free(prepared_key);
     free(decoder_key);
@@ -1715,11 +2077,14 @@ cleanup:
     free(presentation_timestamps);
     free(layout_references);
     free(condition_video_rows);
+    h3_video_encoder_free(video_encoder);
     free(condition_audio_rows);
     h3_text_embedding_free(&text);
     h3_layout_free(&layout);
     if (!dit_is_cached) h3_dit_free(dit);
     if (!decoder_is_cached) h3_video_vae_decoder_free(preview_decoder);
+    if (prefetching) pthread_join(prefetch_thread, NULL);
+    h3_video_vae_decoder_free(prefetch.decoder);
     free(video); free(audio); free(rgb8);
     h3_video_frames_free(&frames);
     h3_audio_waveform_free(&waveform);

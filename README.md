@@ -9,6 +9,59 @@ Prompt-to-video/audio, first/last-frame conditioning, and ordered Ref2VA
 image/video/audio references work end to end. The current work is incremental
 H3-specific Metal performance and memory optimization on M3 Max and M5 Max.
 
+## Community changes in this fork
+
+Upstream has had no commits or merged pull requests since 2026-08-11. This fork
+integrates reviewed community PRs from antirez/h3.c on top of our own changes
+(compact-QKV, bounded safetensors names #74, on-demand Metal pipelines #75).
+Each PR is merged with its original commits; every change was read for malice
+(network, processes, file writes, build rules, encoded data) and none was found.
+
+On by default, output-neutral apart from the race fix:
+
+| PR | Change |
+| --- | --- |
+| [#63](https://github.com/antirez/h3.c/pull/63) | Barrier before reusing the GQA reduction scratch: fixes a race in the text encoder's attention ([#52](https://github.com/antirez/h3.c/issues/52)) |
+| [#44](https://github.com/antirez/h3.c/pull/44) | 16-byte threadgroup memory length for causal GQA (Metal API validation) |
+| [#9](https://github.com/antirez/h3.c/pull/9) | Video VAE RGB output stays finite for non-finite values |
+| [#11](https://github.com/antirez/h3.c/pull/11) | No integer overflow when aligning huge frame counts |
+| [#48](https://github.com/antirez/h3.c/pull/48) | Reject overlapping or gapped safetensors payload offsets |
+| [#56](https://github.com/antirez/h3.c/pull/56) | Register MiniMax's seven control tokens (`<d>`, `</d>`, `<\|cutoff\|>`, caption/lyrics markers); plain prompts tokenize identically |
+| [#59](https://github.com/antirez/h3.c/pull/59) | Build against SDKs older than macOS 26 |
+| [#62](https://github.com/antirez/h3.c/pull/62) | Line-buffer stdout so interactive `Done` lines reach pipes |
+| [#10](https://github.com/antirez/h3.c/pull/10) | Accurate preset, help and callback documentation |
+
+Opt-in, unchanged unless enabled:
+
+| PR | Enable with | Notes |
+| --- | --- | --- |
+| [#73](https://github.com/antirez/h3.c/pull/73) | `H3_VAE_PRECISION=bf16`, `H3_VAE_PREFETCH=1`, `H3_VAE_CACHE=<dir>` | BF16 video VAE decode, decoder load overlapped with the denoise, cached lowered weights. Prefetch and cache are bit-identical; BF16 changes pixels slightly |
+| [#64](https://github.com/antirez/h3.c/pull/64) | `H3_SDPA_MAX_QUERY_ROWS=2048` or `--sdpa-query-block 2048` | Splits long non-causal SDPA queries to avoid MPSGraph corruption on M2/M3 Ultra. Off by default here (upstream PR defaults on) |
+| [#14](https://github.com/antirez/h3.c/pull/14) | `tools/fold_turbo_lora.py` | Offline tool and docs only: fold a step-distillation LoRA into a separate checkpoint for 5-6 step sampling |
+
+Measured on Mac Studio M5 Ultra (256 GB) with the Image Studio draft
+(864×480, 56 frames, `--steps 8 --layers 50 --reuse 1`) and standard
+(1344×768, 56 frames, `--steps 20 --layers 50 --reuse 2`) commands, seed 17,
+warm file cache, one run per configuration:
+
+- Default build: decoded RGB and PCM SHA-256 identical to the previous build for
+  both profiles (draft 37.0 s, standard 117.5 s).
+- `H3_VAE_PREFETCH=1`: bit-identical output; draft 36.5 s.
+- `H3_VAE_PRECISION=bf16 H3_VAE_PREFETCH=1`: draft 29.8 s (-20%), standard
+  99.3 s (-16%); audio identical; video PSNR against F32 53.1 dB (draft) and
+  50.7 dB (standard), worst frame 50.0 dB.
+- MPSGraph non-causal SDPA (56 heads × 128, BF16) at 6,978-33,000 rows matched a
+  float64 reference on 672 sampled row/head pairs per length with and without the
+  #64 split, so the Ultra corruption was not reproduced on M5 Ultra.
+
+Reviewed and not merged: #1 (smaller default VAE tiles: slower, changes output),
+#4 (moves GQA away from MLX parity), #7 and #34 (code paths the CLI does not use),
+#31 (would silently stretch rotated references), #32 (embedded shaders, unused
+when run from the source directory), #33 (default-on lock files, `/tmp` symlink
+hazard), #35 and #68 (interactive-only, #35 non-functional), #55 (SSD attention
+streaming for small-memory Macs), #14's header-alignment check (breaks valid
+files). Out of scope: #2, #43 (CUDA), #45 (GUI) and documentation-only PRs.
+
 ## Tutorial
 
 ### 1. Build and inspect the model
@@ -184,7 +237,7 @@ execution engines differ; the depicted content and motion should agree.
 
 These controls are independent unless noted otherwise:
 
-| Control | Slow reference | Default | Aggressive | Main impact |
+| Control | Slow reference | Balanced fast | Aggressive | Main impact |
 |---|---:|---:|---:|---|
 | Denoising passes | `--steps 50` | `--steps 20` | `--steps 4..7` | The number always names actual denoising passes. |
 | Whole denoiser reuse | `--reuse 1` | `--reuse 2` | `--reuse 3` | At 20 steps: 20, 11, or 8 fresh DiT evaluations. |
@@ -398,10 +451,54 @@ the media semantics:
   -o outputs/fox-image-audio.mp4
 ```
 
+Reference images use `--ref-image-size match` by default, which preserves the
+source aspect ratio while scaling down to approximately the output canvas area.
+Use `--ref-image-size max` to retain more source detail, downscaling only when
+the source's short edge exceeds 2048 pixels. Neither mode enlarges the source.
+
 Reference flags may be repeated and their command-line order is preserved.
 Standalone audio must accompany an image or video reference. Audio references
 must be 2–15 seconds; at most three audio inputs are accepted and their total
 decoded duration is capped at 15 seconds.
+
+## Distilled sampling: fold the Turbo LoRA into the checkpoint
+
+h3.c does not implement a LoRA runtime; step-distillation adapters can instead
+be folded into the checkpoint before inference. `tools/fold_turbo_lora.py`
+applies
+[larryvrh/MiniMax-H3-Turbo-Lora](https://huggingface.co/larryvrh/MiniMax-H3-Turbo-Lora)
+directly to the bf16 shards. The adapter file,
+`minimax_h3_turbo_v4_step600_ema.safetensors`, is Apache-2.0 and remains subject
+to the MiniMax H3 Community License as a derivative. The tool clones the
+original shards and patches only the affected byte ranges. The headers and
+tensor order remain unchanged, as does their alignment:
+
+```sh
+python3 tools/fold_turbo_lora.py \
+  --checkpoint ./MiniMax-H3/FL2VA/transformer \
+  --lora ./minimax_h3_turbo_v4_step600_ema.safetensors \
+  --out ./MiniMax-H3-turbo/FL2VA/transformer
+```
+
+Point `-d` at a model directory whose `FL2VA/transformer` contains the folded
+tree; everything else can be symlinked to the original snapshot. Sample with
+`--steps 5` or `--steps 6` and no other speed flags. The distilled schedule
+removes the redundancy used by `--reuse` and `--core-reuse`, so neither option
+should be combined with it. On fast action, 4 steps showed motion smear; 5 is
+the validated floor.
+
+Cold single-shot measurements on an M5 Max used 960x544 and an identical prompt
+and seed. The comparison is against the tutorial's
+`--steps 20 --reuse 2 --layers 45` preset:
+
+| | balanced preset | folded turbo, 6 steps |
+|---|---:|---:|
+| 39 frames | 87s | 65s |
+| 124-frame (5 s) clip | 8.8min | 6.2min |
+
+On the clips tested, quality at 5-6 steps was comparable to the balanced preset,
+with sharper fine detail as the adapter's card advertises. An interactive
+session also amortizes transformer loading and text encoding across renders.
 
 ## Tests and runtime requirements
 
@@ -428,6 +525,41 @@ uncompressed media file is created.
 
 The remainder documents the implementation behind the tutorial presets and the
 environment variables retained for exact A/B diagnosis.
+
+### Local on-demand pipeline deployment — 2026-10-14
+
+The installed binary includes the measured on-demand Metal pipeline implementation
+from [upstream PR #75](https://github.com/antirez/h3.c/pull/75), while preserving the
+parser and compact-QKV fixes. Direct pipelines are compiled on first use and cached
+within their GPU context; shader-library compilation and arithmetic are unchanged.
+
+One real Studio API draft job produced 56 frames at 864×480 / 24 fps with stereo
+32 kHz audio, seed 17. Complete software decoding, gallery publication and advancing
+browser playback passed. Studio was not restarted, and no generation settings,
+weights, shaders, image runtime or service configuration changed. This serving smoke
+does not establish an API-latency improvement. The public URL remains Access protected;
+verification exercised the actual local backend.
+
+Source, binary, build/API/media/browser receipts and exact rollback files are under
+`../runtimes/lazy-pipelines-20261014/`. For rollback, wait for idle and atomically
+restore that directory's `rollback/h3` to `h3.c/h3`, then restore its `h3_gpu.m` and
+`README.md`. Subsequent workers use the restored binary without a service restart.
+
+### Local parser allocation deployment — 2026-10-14
+
+The installed binary includes [upstream PR #74](https://github.com/antirez/h3.c/pull/74):
+JSON string buffers are sized from the encoded string, rather than the remaining
+safetensors header. The previously installed compact-QKV optimization is preserved.
+The parser change reduces retained tensor-name capacity, not total model memory;
+no generation speedup is claimed.
+
+A real Studio API draft job produced a 56-frame 864×480 clip with stereo audio.
+Complete software decoding, gallery publication and browser playback passed.
+Studio was not restarted; profiles, weights, image runtime and service configuration
+were unchanged. The versioned binary, source, verification and provenance are under
+`../runtimes/parser-allocation-20261014/`. For rollback, wait for idle and atomically
+restore that directory's `rollback/h3` to `h3.c/h3`, then restore the backed-up
+`h3_safetensors.c` and `README.md`. Subsequent workers use the restored binary.
 
 ### Sampler and DiT controls
 
@@ -530,6 +662,80 @@ requested canvas geometry, minimizing repeated overlap work while keeping peak
 storage bounded. `H3_VAE_TILE_PIXELS=256` restores the original conservative
 tile plan for close-reference diagnosis.
 
+The released video VAE weights are F32, and by default every block runs in
+F32. `H3_VAE_PRECISION=bf16` keeps the residual stream, norms and RoPE in F32
+but runs the QKV, attention-output and MLP projections and the attention itself
+on BF16 (TensorOps on M5). On M5 Max a 768x448, 124-frame decode drops from
+43.3 to 13.2 seconds at 75 dB PSNR against F32 (8-bit output differs by at
+most a few levels). `H3_VAE_PRECISION=int8` uses int8 projections: 10.5
+seconds at 51.6 dB, with faint 16-pixel patch structure in difference images.
+`H3_VAE_CACHE=<directory>` stores the BF16 projections (4.8 GiB, named by a
+weight fingerprint) so later runs skip reading and casting the F32 weights,
+and `H3_VAE_PREFETCH=1` loads the decoder on a second thread during the
+denoise; both leave the output bit-identical. `H3_DUMP_VIDEO_LATENT=<file>`
+saves the final latent, and `make vae_bench` builds a tool that replays just
+the VAE decode from it for timing, PSNR comparisons and SHA-256 output hashes
+(`VAE_BENCH_REPEAT=N` decodes N times and checks the repeats agree).
+
+The resident decoder (the prefetched or cached one) runs the tail after the
+denoise as a pipeline. Tile N+1 is committed to the GPU before the host
+waits for tile N, which it then unpacks and stitches into the current chunk
+while N+1 runs; two input and two output slots alternate, and one zero suffix
+token serves every tile instead of per-tile allocations. As each temporal
+chunk is blended its 17 final frames are converted to RGB24 and fed to an
+FFmpeg started before the decode (into a hidden partial file renamed on
+success), so H.264 encoding overlaps the remaining tiles; the single-use DiT
+is torn down on a second thread meanwhile. With BF16 or int8 precision and
+BF16 attention, each block's BF16<->F32 epilogues are fused (the norms write
+BF16 matmul inputs, bias+QK-norm+RoPE+cast and bias+SwiGLU+cast run as one
+kernel each, and the output/MLP biases fold into the residual updates). Every
+value goes through the same arithmetic in the same order, the FFmpeg command
+and the frame bytes it reads are unchanged, so decoded frames, PCM and the
+file bytes are bit-identical; only memory traffic, dispatches, waits and
+serialization change. On an M5 Ultra at 768x1344 and 107 frames with BF16
+projections, the 90-tile decode took 15.1 s instead of 18.0 s (17.5 s with
+the pipeline but unfused epilogues) and the whole tail after the denoise
+16.2 s instead of 19.0 s, with identical RGB/PCM and MP4 file hashes for
+20-step and 6-step renders. `H3_VAE_DECODE_LEGACY=1` restores the released path
+(blocking submit per tile, unfused epilogues, whole-video conversion then
+FFmpeg, inline DiT free) and `H3_VAE_UNFUSED=1` keeps the pipeline but
+unfuses the epilogues. With `H3_PROFILE` the tail prints an
+`output tail` line (prefetch join, DiT free, latent dump, audio VAE, decoder
+acquisition, FFmpeg start, video decode, RGB24 conversion, FFmpeg finish), a
+`video VAE decode` line (GPU wait, encode, input staging, unpack, stitch,
+blend and sink time, plus the command buffers used) and one line per
+delivered chunk. MPSGraph commits its command buffer itself as it encodes
+(`mps-commits`), so a tile spans several command buffers and two queued tiles
+can exceed the Metal queue's default limit of 64 uncompleted buffers. The
+pipelined encoder then blocks creating the next buffer until the GPU retires
+one, which the line reports as `encode` (`mps-encode`, `queue-create`) while
+the GPU is still busy with the queued work. `H3_GPU_QUEUE_DEPTH=<n>` raises the
+limit for every Metal context; it only changes when the host blocks, not what
+the GPU runs.
+
+Single-image anchors (first/last frame) are encoded in a reused ping-pong
+scratch arena instead of allocating per block; each tile chains its blocks
+with `h3_gpu_continue` and waits once, and both anchors share one Metal
+context, weight load and graph cache. The same padding kernel and Conv3d
+graphs run on the same inputs, so only allocation and synchronization change
+and the latents stay bit-identical (two 768x1344 anchors: 8.9 s to 5.8 s on an
+M5 Ultra). `H3_DISABLE_VAE_ENCODER_ARENA=1` restores the released per-block
+allocation and waits; multi-frame reference videos always use that path.
+
+`H3_VAE_ENCODER_CONV2D=1` goes further. The encoder's causal 3x3x3 convs pad
+two zero frames in front of the input, so for a one-frame input only the last
+temporal kernel tap ever touches real data (this includes the time-strided
+downsample convs, whose output stays one frame deep). With the switch, every
+conv runs as an F32 Conv2d over the reflect-padded frame using
+`weight[:, :, 2]`, sliced once per encoder, which removes the two-thirds of
+the multiply-adds that were against zeros (two anchors: 1.1 s). The result is
+mathematically identical but not bit-identical, because MPSGraph accumulates
+Conv2d in a different order (latent relative L2 about 3e-6 from the released
+path), so the generated video changes.
+`make h3_vae_encoder_bench` builds a tool that encodes real anchor images with
+all three paths in one process. It prints per-path timing and each path's
+latent max absolute and relative L2 difference from the released path.
+
 ### Weight residency and streamed prompt encoding
 
 On M5-class GPUs, persistent transformer weights are mapped directly from their
@@ -553,6 +759,72 @@ The first active block is prefetched again during the final block, so a cached
 interactive DiT is ready for its next denoiser evaluation. Measurements reached
 about 13--14.6 GiB/s from the internal SSD. `H3_PROFILE=1` reports total bytes,
 read throughput, and the part of the read wait that was not hidden by GPU work.
+
+### DiT load cache and early load
+
+Each DiT load quantizes every active block's QKV, attention-output, FC1 and FC2
+projections to int8 on the GPU and projects all 50 blocks' AdaLN weights over
+the step schedule. With 50 layers that touches about 60 GiB of BF16 checkpoint
+pages to produce about 18 GiB of results. Two opt-in switches take this work
+off the critical path. Neither changes any output byte.
+
+`H3_DIT_CACHE=<directory>` saves exactly those results. The directory is
+created with mode 0700 if it is missing. Each block gets one file with its int8
+weights and F32 row scales (about 368 MiB, so 18 GiB for 50 blocks). Each step
+schedule and condition kind gets one AdaLN file (about 0.4 GiB at 20 steps).
+Later loads map these files zero-copy, the same way M5 maps transformer
+weights, and make them GPU-resident during the load. They never read the AdaLN
+weights or the BF16 source of a cached matrix.
+
+Files are keyed by:
+
+- a checkpoint fingerprint: the resolved directory plus each shard's name, size
+  and mtime;
+- the block index and the set of stored matrices;
+- the Metal device and TensorOps mode, the macOS build, the shader source
+  content, `H3_INT8_VECTOR_QUANT` and a format version;
+- for AdaLN files only: the step count, every sigma bit, and the visual/audio
+  condition flags.
+
+Because keys are per block, every `--layers` selection shares the same files.
+A missing, stale, truncated or corrupt file silently falls back to the normal
+load. That load rewrites the file through a private temporary file, `fsync` and
+rename. Rewriting a block file also deletes the superseded files for that
+block; stale AdaLN files are small and kept.
+
+`H3_DIT_CACHE_VERIFY=1` recomputes everything the cache supplied and fails the
+load if any byte differs. Each load prints one `h3: DiT cache` summary line.
+With `H3_PROFILE=1` it also reports mapped and written GiB and the write and
+verify times.
+
+`H3_DIT_EARLY_LOAD=1` starts the prompt-independent half of the DiT load on a
+second thread when generation starts: the DiT's Metal context, the AdaLN
+schedule, the gate-ranked layer choice and the persistent block weights. That
+work then overlaps the VAE encoder, Qwen vision and the text encoder. Text
+refinement, row maps, activations and condition rows are still prepared after
+the prompt is encoded, in the same context and with the same kernels as the
+serial path.
+
+The early half is used only if it matches the request: the checkpoint, steps,
+layers, BF16 switches, the visual/audio condition kinds, and a sequence of at
+least 128 rows. If it does not match, or the thread failed, the DiT loads
+serially as before. The DiT then coexists with the encoders, adding about
+20 GiB of peak unified memory, so this mode is intended for 256 GB machines.
+
+With `H3_PROFILE=1`, three lines report the timing:
+
+- `DiT early core`: time spent on the loader thread.
+- `DiT early load join wait`: how long the main thread waited for that thread.
+- `DiT load`: what remained on the main thread, split into phases. It prints
+  in both modes.
+
+On an M5 Ultra at 768x1344, 107 frames, 20 steps with first and last frames,
+the main-thread DiT load fell from 11.7 s to 0.2 s with a warm cache and early
+load (3.1 s of loader-thread work hidden behind the encoders), and the whole
+job from 330.3 s to 318.2 s. Denoise time was unchanged. The first load per
+checkpoint wrote 18.3 GiB in 2.0 s and took 15.6 s instead of 11.7 s. Decoded
+RGB/PCM hashes matched the previous build for cold, verified, warm and early
+loads at 20 and 6 steps.
 
 ### Metal 4 and TensorOps paths
 
@@ -628,6 +900,36 @@ MLP input, while the current attention-output arena becomes the MLP output after
 its branch has been consumed. This removes 61.25 MiB at 512-class geometry and
 99.63 MiB at 864-class geometry without changing dispatches or arithmetic.
 `H3_DISABLE_DIT_ACTIVATION_ALIAS=1` restores separate diagnostic buffers.
+
+On the int8-only QKV path, that shared arena needs only `sequence * 7168`
+BF16 elements, not the packed projection's `sequence * 21504`: int8 QKV writes
+query, key and value directly into their separate head-major tensors. The
+normalized MLP input also fits in the smaller arena. BF16 QKV, retained-BF16
+diagnostics, token reduction and alias-disabled diagnostics keep the original
+capacity. Dispatches, arithmetic, quantization and sampling settings are unchanged.
+
+Local M5 Ultra validation (macOS 27, 2026-10-08) used complete 56-frame clips:
+
+| Profile | DiT tracked peak tensor storage, before → after |
+| --- | --- |
+| 864×480, 8 steps, 50 blocks, reuse 1 | 19.170 → 18.980 GiB |
+| 1344×768, 20 steps, 50 blocks, reuse 2 | 20.940 → 20.476 GiB |
+
+These counters describe H3 tensor allocations, not total process/driver memory.
+No generation-speed improvement is claimed: warm draft runs remained around
+38 seconds and the standard pair measured 120.46/120.79 seconds. Complete video
+and audio decoding passed, including the BF16-QKV fallback. With one prepared
+real-weight model and fixed inputs, three full-versus-compact arena comparisons
+per resolution produced byte-identical video/audio velocities through all 50
+blocks. Independent full generations were not byte-reproducible even with the
+unmodified binary; these checks do not establish end-to-end pixel identity or
+a general visual-quality guarantee.
+
+The same investigation rejected per-block quantization-submission batching,
+wider FC2 tiles, deeper Qwen prefetch, forced cached quantization and copied
+transformer weights as speed defaults. The initial cold-versus-warm difference
+was not attributed to an optimization.
+
 MPSGraph tensor-data wrappers for immutable DiT weights and biases are retained
 with their resident buffers. This avoids rebuilding the same binding metadata
 for every block and denoiser evaluation without copying tensor storage; measured
@@ -714,7 +1016,8 @@ can differ. The current diagnostic implementation retains both BF16 and int8
 MLP weights only when an A/B diagnostic requests them. Normal int8 loading
 releases each block's BF16 FC1/FC2 buffers after their submitted quantization
 finishes, reducing measured peak tensor storage to 25.9 GiB from the BF16
-path's 36.4 GiB. Runtime weight quantization still adds startup time.
+path's 36.4 GiB. Runtime weight quantization still adds startup time unless
+`H3_DIT_CACHE` supplies the int8 weights.
 
 The fastest M5 path also quantizes each DiT QKV projection and writes its
 Q/K/V tiles directly in head-major attention layout before the existing Q/K
@@ -808,4 +1111,5 @@ at every size for A/B comparison.
 
 The native baseline targets the original `FL2VA/` and `Ref2VA/` checkpoint
 trees. Model phases are loaded and released separately so the 33B transformer,
-Qwen encoder, and decoders never have to coexist in unified memory.
+Qwen encoder, and decoders never have to coexist in unified memory. The opt-in
+`H3_DIT_EARLY_LOAD=1` deliberately lets the DiT coexist with the encoders.

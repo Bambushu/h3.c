@@ -62,10 +62,13 @@ int main(int argc, char **argv) {
     char weights[1024];
     snprintf(weights, sizeof(weights), "%s/FL2VA/video_vae/source", model_root);
     h3_video_latent got;
-    if (!h3_video_vae_encode(weights, "h3_shaders.metal", pixels, frames,
-                             height, width,
-                             progress, NULL, &got, error, sizeof(error)))
+    h3_video_encoder *encoder = h3_video_encoder_open(
+        weights, "h3_shaders.metal", error, sizeof(error));
+    if (!encoder ||
+        !h3_video_encoder_encode(encoder, pixels, frames, height, width,
+                                 progress, NULL, &got, error, sizeof(error)))
         die(error);
+    h3_video_encoder_free(encoder);
     if (got.time != h3_video_encoder_latent_t(frames) ||
         got.height != height / 16 ||
         got.width != width / 16)

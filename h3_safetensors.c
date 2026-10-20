@@ -55,7 +55,12 @@ static char *h3_json_string(h3_json_cursor *cursor) {
         return NULL;
     }
     cursor->at++;
-    size_t maximum = (size_t)(cursor->end - cursor->at);
+    /* Encoded bytes bound decoded size; leave validation and cursor updates below. */
+    const char *string_end = cursor->at;
+    while (string_end < cursor->end && *string_end != '"') {
+        if (*string_end++ == '\\' && string_end < cursor->end) string_end++;
+    }
+    size_t maximum = (size_t)(string_end - cursor->at);
     char *result = malloc(maximum + 1);
     if (!result) {
         h3_json_fail(cursor, "out of memory parsing safetensors header");
@@ -356,6 +361,34 @@ static int h3_append_tensor(h3_st_header *header, h3_st_tensor tensor,
     return 1;
 }
 
+static int h3_tensor_offset_compare(const void *left, const void *right) {
+    const h3_st_tensor *a = left;
+    const h3_st_tensor *b = right;
+    if (a->data_begin != b->data_begin)
+        return a->data_begin < b->data_begin ? -1 : 1;
+    if (a->data_end != b->data_end)
+        return a->data_end < b->data_end ? -1 : 1;
+    return 0;
+}
+
+static int h3_validate_offsets(h3_json_cursor *cursor, h3_st_header *header,
+                               uint64_t data_size) {
+    if (header->tensor_count > 1) {
+        qsort(header->tensors, header->tensor_count, sizeof(*header->tensors),
+              h3_tensor_offset_compare);
+    }
+    uint64_t expected = 0;
+    for (size_t index = 0; index < header->tensor_count; index++) {
+        if (header->tensors[index].data_begin != expected) {
+            return h3_json_fail(cursor, "tensor data offsets are not contiguous");
+        }
+        expected = header->tensors[index].data_end;
+    }
+    if (expected != data_size)
+        return h3_json_fail(cursor, "tensor data offsets do not cover file");
+    return 1;
+}
+
 static uint64_t h3_u64_le(const unsigned char bytes[8]) {
     uint64_t value = 0;
     for (unsigned index = 0; index < 8; index++) {
@@ -450,6 +483,8 @@ int h3_st_read_header(const char *path, h3_st_header *header,
         h3_json_fail(&cursor, "trailing data in safetensors header");
         goto fail;
     }
+    if (!h3_validate_offsets(&cursor, header, file_size - 8 - header_size))
+        goto fail;
     free(json);
     return 1;
 

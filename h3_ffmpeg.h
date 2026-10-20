@@ -46,4 +46,22 @@ int h3_ffmpeg_write_av_rgb24_f32(const char *path, const uint8_t *frames,
                                  int channels, int sample_rate,
                                  char *error, size_t error_size);
 
+/* The same encode as h3_ffmpeg_write_av_rgb24_f32 (identical command line,
+ * frame bytes and order), started before the video exists so FFmpeg encodes
+ * while the frames are still being decoded. frames is the caller's
+ * [frame_count, height, width, 3] buffer, which must stay valid until finish
+ * or abort; h3_ffmpeg_av_stream_ready(stream, n) publishes frames [0, n).
+ * FFmpeg writes a hidden partial file next to path that only a successful
+ * finish renames to path; abort kills FFmpeg and removes it. finish and
+ * abort free the stream. */
+typedef struct h3_ffmpeg_av_stream h3_ffmpeg_av_stream;
+h3_ffmpeg_av_stream *h3_ffmpeg_av_stream_open(
+        const char *path, const uint8_t *frames, int frame_count, int width,
+        int height, int fps, const float *pcm, int samples, int channels,
+        int sample_rate, char *error, size_t error_size);
+void h3_ffmpeg_av_stream_ready(h3_ffmpeg_av_stream *stream, int frames);
+int h3_ffmpeg_av_stream_finish(h3_ffmpeg_av_stream *stream, char *error,
+                               size_t error_size);
+void h3_ffmpeg_av_stream_abort(h3_ffmpeg_av_stream *stream);
+
 #endif

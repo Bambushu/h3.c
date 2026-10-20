@@ -1,5 +1,6 @@
 #include "h3_dit.h"
 
+#include "h3_dit_cache.h"
 #include "h3_dit_schedule.h"
 #include "h3_weights.h"
 
@@ -71,6 +72,7 @@ struct h3_dit {
     h3_gpu *gpu;
     h3_weight_store *weights;
     h3_dit_schedule *schedule;
+    h3_dit_cache *cache;  /* H3_DIT_CACHE, open only while loading */
     int fused_mlp;
     int nax_mlp;
     int int8_mlp;
@@ -760,6 +762,248 @@ static int quantize_block_attention_out(h3_dit *dit, h3_dit_block *block,
     return 1;
 }
 
+/* H3_DIT_CACHE int8 files: one per block, holding the int8 weights and F32 row
+ * scales the quantizers above produce for the matrices this load quantizes,
+ * in the order QKV, attention output, FC1, FC2. */
+typedef struct {
+    const char *suffix;
+    const char *label;
+    uint32_t rows;
+    uint32_t columns;
+} int8_matrix;
+
+static const int8_matrix INT8_MATRICES[STREAM_MATRICES] = {
+    [STREAM_QKV] = {"attn.qkv_proj.weight", "QKV", INNER * 3, HIDDEN},
+    [STREAM_OUT] = {"attn.out_proj.weight", "attention output", HIDDEN, INNER},
+    [STREAM_FC1] = {"mlp.fc1.weight", "FC1", FFN * 2, HIDDEN},
+    [STREAM_FC2] = {"mlp.fc2.weight", "FC2", HIDDEN, FFN},
+};
+
+static unsigned int8_matrix_mask(const h3_dit *dit) {
+    unsigned mask = 0;
+    if (dit->int8_qkv) mask |= 1u << STREAM_QKV;
+    if (dit->int8_attention_out) mask |= 1u << STREAM_OUT;
+    if (dit->int8_mlp) mask |= (1u << STREAM_FC1) | (1u << STREAM_FC2);
+    return mask;
+}
+
+static int keeps_bf16(const h3_dit *dit, unsigned matrix) {
+    if (matrix == STREAM_QKV) return dit->keep_bf16_qkv;
+    if (matrix == STREAM_OUT) return dit->keep_bf16_attention_out;
+    return dit->keep_bf16_mlp;
+}
+
+static h3_gpu_tensor **block_bf16(h3_dit_block *block, unsigned matrix) {
+    if (matrix == STREAM_QKV) return &block->qkv;
+    if (matrix == STREAM_OUT) return &block->out;
+    if (matrix == STREAM_FC1) return &block->fc1;
+    return &block->fc2;
+}
+
+static h3_gpu_tensor **block_int8(h3_dit_block *block, unsigned matrix) {
+    if (matrix == STREAM_QKV) return &block->qkv_int8;
+    if (matrix == STREAM_OUT) return &block->out_int8;
+    if (matrix == STREAM_FC1) return &block->fc1_int8;
+    return &block->fc2_int8;
+}
+
+static h3_gpu_tensor **block_scales(h3_dit_block *block, unsigned matrix) {
+    if (matrix == STREAM_QKV) return &block->qkv_scales;
+    if (matrix == STREAM_OUT) return &block->out_scales;
+    if (matrix == STREAM_FC1) return &block->fc1_scales;
+    return &block->fc2_scales;
+}
+
+static int int8_cache_header(const h3_dit *dit, unsigned index, unsigned mask,
+                             h3_dit_cache_header *header,
+                             char *path, size_t path_size) {
+    uint64_t bytes[2 * STREAM_MATRICES];
+    unsigned count = 0;
+    for (unsigned matrix = 0; matrix < STREAM_MATRICES; matrix++) {
+        if (!(mask & (1u << matrix))) continue;
+        bytes[count++] = (uint64_t)INT8_MATRICES[matrix].rows *
+                         INT8_MATRICES[matrix].columns;
+        bytes[count++] = (uint64_t)INT8_MATRICES[matrix].rows * sizeof(float);
+    }
+    uint64_t key = h3_dit_cache_int8_key(dit->cache, index, mask);
+    return h3_dit_cache_header_init(header, H3_DIT_CACHE_INT8, key, bytes,
+                                    count) &&
+           h3_dit_cache_int8_path(dit->cache, index, key, path, path_size);
+}
+
+static int same_bytes(const h3_gpu_tensor *left, const h3_gpu_tensor *right) {
+    size_t bytes = h3_gpu_tensor_bytes(left);
+    return bytes == h3_gpu_tensor_bytes(right) &&
+           !memcmp(h3_gpu_tensor_contents(left),
+                   h3_gpu_tensor_contents(right), bytes);
+}
+
+/* H3_DIT_CACHE_VERIFY: quantize the BF16 sources again and require the cached
+ * bytes to match exactly. */
+static int verify_cached_block(h3_dit *dit, unsigned index, const char *prefix,
+                               unsigned mask, const char *path,
+                               char *error, size_t error_size) {
+    h3_dit_block *block = &dit->blocks[index];
+    double started = stream_now();
+    int ok = 1;
+    for (unsigned matrix = 0; ok && matrix < STREAM_MATRICES; matrix++) {
+        if (!(mask & (1u << matrix))) continue;
+        const int8_matrix *shape = &INT8_MATRICES[matrix];
+        h3_gpu_tensor *source = *block_bf16(block, matrix);
+        h3_gpu_tensor *loaded = NULL;
+        if (!source) {
+            char name[160];
+            snprintf(name, sizeof(name), "%s%s", prefix, shape->suffix);
+            source = loaded = bf2(dit, name, shape->rows, shape->columns,
+                                  error, error_size);
+        }
+        h3_gpu_tensor *weights = h3_gpu_tensor_new_i8(
+            dit->gpu, (size_t)shape->rows * shape->columns);
+        h3_gpu_tensor *scales = h3_gpu_tensor_new_f32(dit->gpu, shape->rows);
+        ok = source && weights && scales && h3_gpu_begin(dit->gpu) &&
+             h3_gpu_quantize_weight_int8(dit->gpu, weights, scales, source,
+                                         shape->rows, shape->columns) &&
+             h3_gpu_submit(dit->gpu);
+        if (!ok) {
+            if (!error || !*error)
+                fail(error, error_size,
+                     "H3_DIT_CACHE_VERIFY: cannot requantize block %u %s: %s",
+                     index, shape->label, h3_gpu_error(dit->gpu));
+        } else if (!same_bytes(*block_int8(block, matrix), weights) ||
+                   !same_bytes(*block_scales(block, matrix), scales)) {
+            fail(error, error_size,
+                 "H3_DIT_CACHE_VERIFY: cached int8 %s of block %u in %s "
+                 "differs from a fresh quantization", shape->label, index,
+                 path);
+            ok = 0;
+        }
+        free_tensor(&weights);
+        free_tensor(&scales);
+        free_tensor(&loaded);
+    }
+    dit->cache->verify_seconds += stream_now() - started;
+    return ok;
+}
+
+/* Fault in and wire zero-copy cache mappings now, as the quantizer's GPU
+ * writes did for freshly computed weights, instead of in the first forward. */
+static int make_resident(h3_gpu *gpu, h3_gpu_tensor *const *tensors,
+                         size_t count) {
+    if (!h3_gpu_begin(gpu)) return 0;
+    int ok = h3_gpu_make_resident(gpu, tensors, count);
+    return h3_gpu_submit(gpu) && ok;
+}
+
+/* Returns 1 when the block was mapped from the cache, 0 to load and quantize
+ * it from the checkpoint (the block is left empty), and -1 when
+ * H3_DIT_CACHE_VERIFY found a difference. The BF16 source of a cached matrix
+ * is read only for H3_INT8_KEEP_BF16_* diagnostics or verification. */
+static int load_cached_block(h3_dit *dit, unsigned index, const char *prefix,
+                             unsigned mask, const h3_dit_cache_header *header,
+                             const char *path, char *error,
+                             size_t error_size) {
+    if (!h3_dit_cache_valid(path, header)) return 0;
+    h3_dit_block *block = &dit->blocks[index];
+    h3_gpu_tensor *mapped[2 * STREAM_MATRICES];
+    unsigned entry = 0;
+    int ok = load_block_norms(dit, block, prefix, error, error_size);
+    for (unsigned matrix = 0; ok && matrix < STREAM_MATRICES; matrix++) {
+        const int8_matrix *shape = &INT8_MATRICES[matrix];
+        int quantized = (mask & (1u << matrix)) != 0;
+        if (!quantized || keeps_bf16(dit, matrix)) {
+            char name[160];
+            snprintf(name, sizeof(name), "%s%s", prefix, shape->suffix);
+            *block_bf16(block, matrix) = bf2(dit, name, shape->rows,
+                                             shape->columns, error,
+                                             error_size);
+            ok = *block_bf16(block, matrix) != NULL;
+        }
+        if (!ok || !quantized) continue;
+        *block_int8(block, matrix) = h3_gpu_tensor_load_cache(
+            dit->gpu, path, header->entries[entry].offset,
+            (size_t)shape->rows * shape->columns, H3_GPU_I8);
+        *block_scales(block, matrix) = h3_gpu_tensor_load_cache(
+            dit->gpu, path, header->entries[entry + 1].offset, shape->rows,
+            H3_GPU_F32);
+        ok = *block_int8(block, matrix) && *block_scales(block, matrix);
+        mapped[entry] = *block_int8(block, matrix);
+        mapped[entry + 1] = *block_scales(block, matrix);
+        entry += 2;
+    }
+    if (!ok || !make_resident(dit->gpu, mapped, entry)) {
+        free_block(block);
+        if (error && error_size) error[0] = '\0';
+        return 0;
+    }
+    if (dit->cache->verify &&
+        !verify_cached_block(dit, index, prefix, mask, path, error,
+                             error_size)) return -1;
+    for (unsigned at = 0; at < entry; at++)
+        dit->cache->read_bytes += header->entries[at].bytes;
+    return 1;
+}
+
+static void store_cached_block(h3_dit *dit, unsigned index, unsigned mask,
+                               const h3_dit_cache_header *header,
+                               const char *path) {
+    h3_dit_cache *cache = dit->cache;
+    if (cache->write_failed) return;
+    h3_dit_block *block = &dit->blocks[index];
+    const void *payloads[2 * STREAM_MATRICES];
+    unsigned count = 0;
+    for (unsigned matrix = 0; matrix < STREAM_MATRICES; matrix++) {
+        if (!(mask & (1u << matrix))) continue;
+        payloads[count++] = h3_gpu_tensor_contents(*block_int8(block, matrix));
+        payloads[count++] = h3_gpu_tensor_contents(
+            *block_scales(block, matrix));
+    }
+    char detail[512];
+    double started = stream_now();
+    if (!h3_dit_cache_write(path, header, payloads, detail, sizeof(detail))) {
+        cache->write_failed = 1;
+        fprintf(stderr, "h3: warning: DiT int8 cache not written: %s\n",
+                detail);
+        return;
+    }
+    cache->write_seconds += stream_now() - started;
+    cache->written_bytes += header->file_bytes;
+    cache->int8_writes++;
+    h3_dit_cache_prune_int8(cache, index, path);
+}
+
+/* Persistent weights of one resident block: BF16 sources plus the runtime
+ * int8 copies, or the exact int8 bytes from H3_DIT_CACHE. */
+static int load_quantized_block(h3_dit *dit, unsigned index,
+                                const char *prefix,
+                                char *error, size_t error_size) {
+    h3_dit_block *block = &dit->blocks[index];
+    unsigned mask = dit->cache ? int8_matrix_mask(dit) : 0;
+    h3_dit_cache_header header;
+    char path[1200];
+    if (mask && !int8_cache_header(dit, index, mask, &header, path,
+                                   sizeof(path))) mask = 0;
+    if (mask) {
+        int cached = load_cached_block(dit, index, prefix, mask, &header,
+                                       path, error, error_size);
+        if (cached < 0) return 0;
+        if (cached) {
+            dit->cache->int8_hits++;
+            return 1;
+        }
+        dit->cache->int8_misses++;
+    }
+    if (!load_block(dit, block, prefix, error, error_size)) return 0;
+    if (dit->int8_mlp &&
+        !quantize_block_mlp(dit, block, error, error_size)) return 0;
+    if (dit->int8_qkv &&
+        !quantize_block_qkv(dit, block, error, error_size)) return 0;
+    if (dit->int8_attention_out &&
+        !quantize_block_attention_out(dit, block, error, error_size))
+        return 0;
+    if (mask) store_cached_block(dit, index, mask, &header, path);
+    return 1;
+}
+
 static int run_refiner_block(h3_dit *dit, const h3_dit_block *weight,
                              h3_gpu_tensor *hidden, h3_gpu_tensor *norm,
                              h3_gpu_tensor *qkv, h3_gpu_tensor *query,
@@ -1253,18 +1497,9 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
                                   error, error_size) ||
                 !prepare_stream_layer(dit, index, error, error_size))
                 return 0;
-        } else {
-            if (!load_block(dit, &dit->blocks[index], prefix,
-                            error, error_size)) return 0;
-            if (dit->int8_mlp &&
-                !quantize_block_mlp(dit, &dit->blocks[index],
-                                    error, error_size)) return 0;
-            if (dit->int8_qkv &&
-                !quantize_block_qkv(dit, &dit->blocks[index],
-                                    error, error_size)) return 0;
-            if (dit->int8_attention_out &&
-                !quantize_block_attention_out(
-                    dit, &dit->blocks[index], error, error_size)) return 0;
+        } else if (!load_quantized_block(dit, index, prefix,
+                                         error, error_size)) {
+            return 0;
         }
         report(progress, opaque, "load transformer core", (int)index + 1,
                H3_DIT_BLOCKS);
@@ -1364,6 +1599,13 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
         !getenv("H3_DISABLE_FUSED_PATCH_CAST") && !getenv("H3_SCALAR_PATCH");
     dit->fused_patch_pack = dit->fused_patch_projection &&
         !getenv("H3_DISABLE_FUSED_PATCH_PACK");
+    /* Int8 QKV writes the three head-major tensors directly. Without a
+     * BF16 fallback or token-reduction bypass, this arena only backs the
+     * attention heads (INNER) and normalized MLP input (HIDDEN). */
+    size_t qkv_width = INNER * 3;
+    if (dit->activation_aliases && dit->int8_qkv &&
+        !dit->keep_bf16_qkv && !dit->token_reduction)
+        qkv_width = INNER;
 #define BF(field, elements) (dit->field = h3_gpu_tensor_new_bf16(dit->gpu, (elements)))
 #define F32(field, elements) (dit->field = h3_gpu_tensor_new_f32(dit->gpu, (elements)))
     h3_gpu_tensor *all[] = {
@@ -1371,7 +1613,7 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
         F32(audio_input, audio_total * AUDIO_CHANNELS),
         BF(hidden, sequence * HIDDEN),
         BF(mod_attention, sequence * HIDDEN),
-        BF(qkv, sequence * INNER * 3),
+        BF(qkv, sequence * qkv_width),
         BF(query, sequence * INNER),
         BF(key, sequence * INNER),
         BF(value, sequence * INNER),
@@ -1556,7 +1798,175 @@ static void schedule_report(int completed, int total, void *opaque) {
     report(state->callback, state->opaque, "precompute AdaLN", completed, total);
 }
 
-static h3_dit *load_dit(const char *weight_directory,
+/* H3_DIT_EARLY_LOAD: the prompt-independent half of a load (Metal context,
+ * AdaLN schedule, gate-ranked layer selection and persistent block weights),
+ * prepared on another thread while the prompt and anchors are encoded. The
+ * fields record the request it was prepared for; take_core() adopts it only
+ * for exactly that request. */
+struct h3_dit_core {
+    h3_dit *dit;
+    char *weight_directory;
+    char *shader_source_path;
+    unsigned active_blocks;
+    int visual_condition;
+    int audio_condition;
+    int ssd_streaming;
+    int use_slower_bf16_mlp;
+    int use_slower_bf16_qkv;
+    int use_slower_bf16_attention_output;
+};
+
+static h3_dit *new_dit(unsigned active_blocks, int ssd_streaming) {
+    h3_dit *dit = calloc(1, sizeof(*dit));
+    if (!dit) return NULL;
+    dit->fused_mlp = getenv("H3_DISABLE_FUSED_MLP") == NULL;
+    /* The released final heads are F32, but their inputs are already BF16.
+     * Converting these small weights once selects the Iris-derived tiled
+     * linear and eliminates two full-width casts plus the scalar F32 kernel.
+     * Keep the old path available for close-reference diagnosis. */
+    dit->bf16_final = getenv("H3_DIT_F32_FINAL") == NULL;
+    dit->ssd_streaming = ssd_streaming;
+    configure_active_blocks(dit, active_blocks);
+    return dit;
+}
+
+static void open_cache(h3_dit *dit, const char *weight_directory,
+                       const char *shader_source_path) {
+    const char *directory = getenv("H3_DIT_CACHE");
+    if (!directory || !*directory) return;
+    char description[512];
+    h3_dit_cache *cache = calloc(1, sizeof(*cache));
+    if (!cache ||
+        !h3_gpu_describe(dit->gpu, description, sizeof(description)) ||
+        !h3_dit_cache_init(cache, directory, weight_directory, description,
+                           shader_source_path)) {
+        free(cache);
+        fprintf(stderr, "h3: warning: H3_DIT_CACHE=%s is not usable; "
+                "loading without it\n", directory);
+        return;
+    }
+    const char *verify = getenv("H3_DIT_CACHE_VERIFY");
+    cache->verify = verify && *verify && strcmp(verify, "0");
+    dit->cache = cache;
+}
+
+static void close_cache(h3_dit *dit) {
+    h3_dit_cache *cache = dit->cache;
+    if (!cache) return;
+    dit->cache = NULL;
+    fprintf(stderr, "h3: DiT cache %s: int8 %u/%u blocks mapped, %u written; "
+            "AdaLN %s%s\n", cache->directory, cache->int8_hits,
+            cache->int8_hits + cache->int8_misses, cache->int8_writes,
+            cache->adaln_hit ? "mapped" :
+            cache->adaln_written ? "written" : "not cached",
+            cache->verify && (cache->int8_hits || cache->adaln_hit) ?
+            "; verified byte-identical" : "");
+    if (getenv("H3_PROFILE")) {
+        const double gib = 1024.0 * 1024.0 * 1024.0;
+        fprintf(stderr, "h3 profile: DiT cache mapped=%.3fGiB "
+                "written=%.3fGiB write=%.3fs verify=%.3fs\n",
+                (double)cache->read_bytes / gib,
+                (double)cache->written_bytes / gib, cache->write_seconds,
+                cache->verify_seconds);
+    }
+    free(cache);
+}
+
+/* Open the weights, the Metal context and H3_DIT_CACHE, and choose the int8
+ * paths. long_sequence is sequence >= 128, the int8 QKV/output threshold. */
+static int open_model(h3_dit *dit, const char *weight_directory,
+                      const char *shader_source_path, int long_sequence,
+                      int use_slower_bf16_mlp, int use_slower_bf16_qkv,
+                      int use_slower_bf16_attention_output,
+                      char *error, size_t error_size) {
+    dit->weights = h3_weight_store_open(weight_directory, error, error_size);
+    if (!dit->weights) return 0;
+    dit->gpu = h3_gpu_create(shader_source_path, error, error_size);
+    if (!dit->gpu) return 0;
+    dit->nax_mlp = dit->fused_mlp && h3_gpu_has_nax_mlp(dit->gpu);
+    dit->int8_mlp = !dit->ssd_streaming && dit->fused_mlp &&
+                    !use_slower_bf16_mlp &&
+                    h3_gpu_has_int8_mlp(dit->gpu);
+    dit->int8_qkv = !dit->ssd_streaming && !use_slower_bf16_qkv &&
+                    long_sequence && h3_gpu_has_int8_mlp(dit->gpu);
+    dit->int8_attention_out = !dit->ssd_streaming &&
+                              !use_slower_bf16_attention_output &&
+                              long_sequence &&
+                              h3_gpu_has_int8_mlp(dit->gpu);
+    dit->keep_bf16_attention_out = dit->int8_attention_out &&
+        (getenv("H3_INT8_KEEP_BF16_ATTENTION_OUT") ||
+         getenv("H3_BENCH_INT8_ATTENTION_OUT_AB"));
+    dit->keep_bf16_qkv = dit->int8_qkv &&
+        (getenv("H3_INT8_KEEP_BF16_QKV") ||
+         getenv("H3_BENCH_INT8_QKV_AB"));
+    dit->keep_bf16_mlp = dit->int8_mlp &&
+        (getenv("H3_INT8_KEEP_BF16_MLP") ||
+         getenv("H3_BENCH_INT8_MLP_AB") ||
+         getenv("H3_INT8_MLP_STAGE"));
+    h3_gpu_profile_set_label(dit->gpu, "H3 DiT");
+    open_cache(dit, weight_directory, shader_source_path);
+    return 1;
+}
+
+/* AdaLN schedule plus the gate-ranked layer selection that reads it. */
+static int load_schedule(h3_dit *dit, const h3_sigma_schedule *sigmas,
+                         int visual_condition, int audio_condition,
+                         h3_dit_progress progress, void *progress_opaque,
+                         char *error, size_t error_size) {
+    schedule_progress schedule_state = {progress, progress_opaque};
+    dit->schedule = h3_dit_schedule_precompute(
+        dit->weights, dit->gpu, sigmas, visual_condition, audio_condition,
+        dit->cache, schedule_report, &schedule_state, error, error_size);
+    if (!dit->schedule) return 0;
+    configure_gate_ranked_blocks(dit);
+    h3_dit_schedule_prune(dit->schedule, dit->block_active, H3_DIT_BLOCKS);
+    return 1;
+}
+
+static int same_sigmas(const h3_sigma_schedule *left,
+                       const h3_sigma_schedule *right) {
+    if (left->steps != right->steps || left->steps < 1 ||
+        left->steps > H3_MAX_STEPS) return 0;
+    size_t bytes = ((size_t)left->steps + 1) * sizeof(float);
+    return !memcmp(left->video, right->video, bytes) &&
+           !memcmp(left->audio, right->audio, bytes);
+}
+
+/* Adopt an early-loaded core prepared for exactly this request, or release it
+ * so the caller loads serially. Always consumes core. */
+static h3_dit *take_core(h3_dit_core *core, const char *weight_directory,
+                         const char *shader_source_path,
+                         const h3_layout *layout,
+                         const h3_sigma_schedule *sigmas,
+                         unsigned active_blocks, int ssd_streaming,
+                         int use_slower_bf16_mlp, int use_slower_bf16_qkv,
+                         int use_slower_bf16_attention_output) {
+    if (!core) return NULL;
+    h3_dit *dit = NULL;
+    if (core->dit &&
+        !strcmp(core->weight_directory, weight_directory) &&
+        !strcmp(core->shader_source_path, shader_source_path) &&
+        core->active_blocks == active_blocks &&
+        core->ssd_streaming == ssd_streaming &&
+        core->use_slower_bf16_mlp == use_slower_bf16_mlp &&
+        core->use_slower_bf16_qkv == use_slower_bf16_qkv &&
+        core->use_slower_bf16_attention_output ==
+            use_slower_bf16_attention_output &&
+        core->visual_condition == (layout->img_cond_rows != 0) &&
+        core->audio_condition == (layout->audio_cond_rows != 0) &&
+        layout->seq_len >= 128 && same_sigmas(&core->dit->sigmas, sigmas)) {
+        dit = core->dit;
+        core->dit = NULL;
+    } else {
+        fprintf(stderr, "h3: warning: early-loaded DiT core does not match "
+                "this request; loading serially\n");
+    }
+    h3_dit_core_free(core);
+    return dit;
+}
+
+static h3_dit *load_dit(h3_dit_core *core,
+                        const char *weight_directory,
                         const char *shader_source_path,
                         const h3_text_embedding *text,
                         const h3_layout *layout,
@@ -1591,23 +2001,22 @@ static h3_dit *load_dit(const char *weight_directory,
         active_blocks > H3_DIT_BLOCKS || core_reuse_interval < 1 ||
         core_reuse_interval > 6) {
         fail(error, error_size, "invalid DiT load arguments");
+        h3_dit_core_free(core);
         return NULL;
     }
-    h3_dit *dit = calloc(1, sizeof(*dit));
+    double started = stream_now();
+    h3_dit *dit = take_core(core, weight_directory, shader_source_path,
+                            layout, sigmas, active_blocks, ssd_streaming,
+                            use_slower_bf16_mlp, use_slower_bf16_qkv,
+                            use_slower_bf16_attention_output);
+    int preloaded = dit != NULL;
+    if (!dit) dit = new_dit(active_blocks, ssd_streaming);
     if (!dit) {
         fail(error, error_size, "out of memory creating DiT model");
         return NULL;
     }
-    dit->fused_mlp = getenv("H3_DISABLE_FUSED_MLP") == NULL;
-    /* The released final heads are F32, but their inputs are already BF16.
-     * Converting these small weights once selects the Iris-derived tiled
-     * linear and eliminates two full-width casts plus the scalar F32 kernel.
-     * Keep the old path available for close-reference diagnosis. */
-    dit->bf16_final = getenv("H3_DIT_F32_FINAL") == NULL;
     dit->core_reuse_interval = core_reuse_interval;
-    dit->ssd_streaming = ssd_streaming;
     dit->spatial_rope_scale = spatial_rope_scale;
-    configure_active_blocks(dit, active_blocks);
     if (!copy_layout(dit, layout, error, error_size) ||
         !validate_layout(dit, text, error, error_size) ||
         !configure_token_reduction(dit, token_reduction,
@@ -1625,21 +2034,11 @@ static h3_dit *load_dit(const char *weight_directory,
         goto failed;
     }
     dit->sigmas = *sigmas;
-    dit->weights = h3_weight_store_open(weight_directory, error, error_size);
-    if (!dit->weights) goto failed;
-    dit->gpu = h3_gpu_create(shader_source_path, error, error_size);
-    if (!dit->gpu) goto failed;
-    dit->nax_mlp = dit->fused_mlp && h3_gpu_has_nax_mlp(dit->gpu);
-    dit->int8_mlp = !dit->ssd_streaming && dit->fused_mlp &&
-                    !use_slower_bf16_mlp &&
-                    h3_gpu_has_int8_mlp(dit->gpu);
-    dit->int8_qkv = !dit->ssd_streaming && !use_slower_bf16_qkv &&
-                    dit->sequence >= 128 &&
-                    h3_gpu_has_int8_mlp(dit->gpu);
-    dit->int8_attention_out = !dit->ssd_streaming &&
-                              !use_slower_bf16_attention_output &&
-                              dit->sequence >= 128 &&
-                              h3_gpu_has_int8_mlp(dit->gpu);
+    if (!preloaded &&
+        !open_model(dit, weight_directory, shader_source_path,
+                    dit->sequence >= 128, use_slower_bf16_mlp,
+                    use_slower_bf16_qkv, use_slower_bf16_attention_output,
+                    error, error_size)) goto failed;
     dit->use_slower_row_major_attention_output =
         use_slower_row_major_attention_output;
     dit->use_slower_unfused_int8_inputs =
@@ -1650,38 +2049,34 @@ static h3_dit *load_dit(const char *weight_directory,
     dit->use_slower_uncached_int8_scales =
         use_slower_uncached_int8_scales;
     dit->use_slower_dynamic_fc1_k = use_slower_dynamic_fc1_k;
-    dit->keep_bf16_attention_out = dit->int8_attention_out &&
-        (getenv("H3_INT8_KEEP_BF16_ATTENTION_OUT") ||
-         getenv("H3_BENCH_INT8_ATTENTION_OUT_AB"));
-    dit->keep_bf16_qkv = dit->int8_qkv &&
-        (getenv("H3_INT8_KEEP_BF16_QKV") ||
-         getenv("H3_BENCH_INT8_QKV_AB"));
     dit->use_slower_grouped_quantizer = use_slower_grouped_quantizer;
     dit->use_int8_row_fc2 = dit->int8_mlp && use_int8_row_fc2;
-    dit->keep_bf16_mlp = dit->int8_mlp &&
-        (getenv("H3_INT8_KEEP_BF16_MLP") ||
-         getenv("H3_BENCH_INT8_MLP_AB") ||
-         getenv("H3_INT8_MLP_STAGE"));
-    h3_gpu_profile_set_label(dit->gpu, "H3 DiT");
+    double opened = stream_now();
     report(progress, progress_opaque, "refine text", 0, 1);
     if (!refine_text(dit, text, error, error_size)) goto failed;
     report(progress, progress_opaque, "refine text", 1, 1);
-    schedule_progress schedule_state = {progress, progress_opaque};
-    dit->schedule = h3_dit_schedule_precompute(
-        dit->weights, dit->gpu, sigmas, dit->video_condition_rows != 0,
-        dit->audio_condition_rows != 0, schedule_report, &schedule_state,
-        error, error_size);
-    if (dit->schedule) {
-        configure_gate_ranked_blocks(dit);
-        h3_dit_schedule_prune(dit->schedule, dit->block_active,
-                              H3_DIT_BLOCKS);
-    }
-    if (!dit->schedule || !prepare_rope(dit, error, error_size) ||
+    double refined = stream_now();
+    if (preloaded)
+        report(progress, progress_opaque, "precompute AdaLN",
+               (int)H3_DIT_BLOCKS, (int)H3_DIT_BLOCKS);
+    else if (!load_schedule(dit, sigmas, dit->video_condition_rows != 0,
+                            dit->audio_condition_rows != 0, progress,
+                            progress_opaque, error, error_size))
+        goto failed;
+    double scheduled = stream_now();
+    if (!prepare_rope(dit, error, error_size) ||
         !prepare_maps(dit, text, error, error_size) ||
         !prepare_projection_maps(dit, error, error_size) ||
-        !prepare_token_reduction_maps(dit, error, error_size) ||
-        !load_core(dit, progress, progress_opaque, error, error_size) ||
-        !allocate_activations(dit, error, error_size)) goto failed;
+        !prepare_token_reduction_maps(dit, error, error_size)) goto failed;
+    double mapped = stream_now();
+    if (preloaded)
+        report(progress, progress_opaque, "load transformer core",
+               (int)H3_DIT_BLOCKS, (int)H3_DIT_BLOCKS);
+    else if (!load_core(dit, progress, progress_opaque, error, error_size))
+        goto failed;
+    close_cache(dit);
+    double loaded = stream_now();
+    if (!allocate_activations(dit, error, error_size)) goto failed;
     if ((wanted_video_condition && !h3_gpu_tensor_write_f32_range(
              dit->video_input, 0, condition_video_rows,
              wanted_video_condition)) ||
@@ -1691,11 +2086,141 @@ static h3_dit *load_dit(const char *weight_directory,
         fail(error, error_size, "cannot write persistent DiT condition rows");
         goto failed;
     }
+    if (getenv("H3_PROFILE")) {
+        double finished = stream_now();
+        fprintf(stderr, "h3 profile: DiT load wall=%.3fs open=%.3fs "
+                "refine=%.3fs adaln=%.3fs maps=%.3fs core=%.3fs "
+                "activations=%.3fs%s\n", finished - started,
+                opened - started, refined - opened, scheduled - refined,
+                mapped - scheduled, loaded - mapped, finished - loaded,
+                preloaded ? " (context, AdaLN and core early-loaded)" : "");
+    }
     h3_gpu_profile_mark(dit->gpu, "load");
     return dit;
 failed:
     h3_dit_free(dit);
     return NULL;
+}
+
+h3_dit_core *h3_dit_core_load(const char *weight_directory,
+                              const char *shader_source_path,
+                              const h3_sigma_schedule *sigmas,
+                              unsigned active_blocks,
+                              int visual_condition, int audio_condition,
+                              int ssd_streaming,
+                              int use_slower_bf16_mlp,
+                              int use_slower_bf16_qkv,
+                              int use_slower_bf16_attention_output,
+                              char *error, size_t error_size) {
+    if (error && error_size) error[0] = '\0';
+    if (!weight_directory || !shader_source_path || !sigmas ||
+        (ssd_streaming != 0 && ssd_streaming != 1) ||
+        active_blocks < H3_DIT_BLOCKS / 2 || active_blocks > H3_DIT_BLOCKS) {
+        fail(error, error_size, "invalid DiT core load arguments");
+        return NULL;
+    }
+    double started = stream_now();
+    h3_dit_core *core = calloc(1, sizeof(*core));
+    if (core) {
+        core->weight_directory = strdup(weight_directory);
+        core->shader_source_path = strdup(shader_source_path);
+        core->dit = new_dit(active_blocks, ssd_streaming);
+    }
+    if (!core || !core->weight_directory || !core->shader_source_path ||
+        !core->dit) {
+        fail(error, error_size, "out of memory creating DiT core");
+        h3_dit_core_free(core);
+        return NULL;
+    }
+    core->active_blocks = active_blocks;
+    core->visual_condition = visual_condition != 0;
+    core->audio_condition = audio_condition != 0;
+    core->ssd_streaming = ssd_streaming;
+    core->use_slower_bf16_mlp = use_slower_bf16_mlp;
+    core->use_slower_bf16_qkv = use_slower_bf16_qkv;
+    core->use_slower_bf16_attention_output =
+        use_slower_bf16_attention_output;
+    h3_dit *dit = core->dit;
+    dit->sigmas = *sigmas;
+    /* Every real render has far more than 128 rows; take_core() rejects the
+     * core for a request where that prediction is wrong. */
+    if (!open_model(dit, weight_directory, shader_source_path, 1,
+                    use_slower_bf16_mlp, use_slower_bf16_qkv,
+                    use_slower_bf16_attention_output, error, error_size))
+        goto failed;
+    double opened = stream_now();
+    if (!load_schedule(dit, sigmas, core->visual_condition,
+                       core->audio_condition, NULL, NULL, error, error_size))
+        goto failed;
+    double scheduled = stream_now();
+    if (!load_core(dit, NULL, NULL, error, error_size)) goto failed;
+    close_cache(dit);
+    if (getenv("H3_PROFILE")) {
+        double finished = stream_now();
+        fprintf(stderr, "h3 profile: DiT early core wall=%.3fs open=%.3fs "
+                "adaln=%.3fs core=%.3fs\n", finished - started,
+                opened - started, scheduled - opened, finished - scheduled);
+    }
+    return core;
+failed:
+    h3_dit_core_free(core);
+    return NULL;
+}
+
+void h3_dit_core_free(h3_dit_core *core) {
+    if (!core) return;
+    h3_dit_free(core->dit);
+    free(core->weight_directory);
+    free(core->shader_source_path);
+    free(core);
+}
+
+h3_dit *h3_dit_load_with_core(
+                         h3_dit_core *core,
+                         const char *weight_directory,
+                         const char *shader_source_path,
+                         const h3_text_embedding *text,
+                         const h3_layout *layout,
+                         const h3_sigma_schedule *sigmas,
+                         unsigned active_blocks,
+                         unsigned core_reuse_interval,
+                         int token_reduction,
+                         int ssd_streaming,
+                         float spatial_rope_scale,
+                         int use_slower_bf16_mlp,
+                         int use_slower_bf16_qkv,
+                         int use_slower_bf16_attention_output,
+                         int use_slower_row_major_attention_output,
+                         int use_slower_unfused_int8_inputs,
+                         int use_slower_unfused_qkv_rope,
+                         int use_slower_scalar_qkv_rms,
+                         int use_slower_uncached_int8_scales,
+                         int use_slower_dynamic_fc1_k,
+                         int use_slower_grouped_quantizer,
+                         int use_int8_row_fc2,
+                         const float *condition_video_rows,
+                         size_t condition_video_elements,
+                         const float *condition_audio_rows,
+                         size_t condition_audio_elements,
+                         h3_dit_progress progress, void *progress_opaque,
+                         char *error, size_t error_size) {
+    return load_dit(core, weight_directory, shader_source_path, text, layout,
+                    sigmas, active_blocks, core_reuse_interval,
+                    token_reduction, ssd_streaming,
+                    spatial_rope_scale,
+                    use_slower_bf16_mlp, use_slower_bf16_qkv,
+                    use_slower_bf16_attention_output,
+                    use_slower_row_major_attention_output,
+                    use_slower_unfused_int8_inputs,
+                    use_slower_unfused_qkv_rope,
+                    use_slower_scalar_qkv_rms,
+                    use_slower_uncached_int8_scales,
+                    use_slower_dynamic_fc1_k,
+                    use_slower_grouped_quantizer,
+                    use_int8_row_fc2,
+                    condition_video_rows, condition_video_elements,
+                    condition_audio_rows, condition_audio_elements,
+                    progress, progress_opaque, error, error_size);
 }
 
 h3_dit *h3_dit_load_t2va(const char *weight_directory,
@@ -1721,7 +2246,8 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
                          int use_int8_row_fc2,
                          h3_dit_progress progress, void *progress_opaque,
                          char *error, size_t error_size) {
-    return load_dit(weight_directory, shader_source_path, text, layout, sigmas,
+    return load_dit(NULL, weight_directory, shader_source_path, text, layout,
+                    sigmas,
                     active_blocks, core_reuse_interval, token_reduction,
                     ssd_streaming,
                     spatial_rope_scale,
@@ -1767,7 +2293,8 @@ h3_dit *h3_dit_load_conditioned(
                          size_t condition_audio_elements,
                          h3_dit_progress progress, void *progress_opaque,
                          char *error, size_t error_size) {
-    return load_dit(weight_directory, shader_source_path, text, layout, sigmas,
+    return load_dit(NULL, weight_directory, shader_source_path, text, layout,
+                    sigmas,
                     active_blocks, core_reuse_interval, token_reduction,
                     ssd_streaming,
                     spatial_rope_scale,
@@ -3057,6 +3584,7 @@ void h3_dit_free(h3_dit *dit) {
     }
     h3_gpu_free(dit->gpu);
     h3_weight_store_free(dit->weights);
+    free(dit->cache);
     h3_layout_free(&dit->layout);
     free(dit);
 }

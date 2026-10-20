@@ -1,14 +1,23 @@
 #include "h3_host.h"
 #include "h3_dit.h"
+#include "h3_dit_cache.h"
 #include "h3_metal.h"
 #include "h3_safetensors.h"
 #include "h3_terminal.h"
+#include "h3_ffmpeg.h"
+#include "h3_video_encoder.h"
+#include "h3_video_vae.h"
 
+#include <fcntl.h>
 #include <math.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 static int tests_run;
@@ -37,6 +46,7 @@ static void test_temporal_and_canvas(void) {
         CHECK(got.video_t == cases[index].video_t);
         CHECK(got.audio_t == cases[index].audio_t);
     }
+    CHECK(h3_align_frame_count(INT32_MAX) == 0);
     CHECK(h3_video_encoder_latent_t(1) == 1);
     CHECK(h3_video_encoder_latent_t(5) == 2);
     CHECK(h3_video_encoder_latent_t(22) == 6);
@@ -258,8 +268,8 @@ static void test_safetensors(void) {
     int descriptor = mkstemp(path);
     CHECK(descriptor >= 0);
     const char header_json[] =
-        "{\"x\":{\"dtype\":\"F32\",\"shape\":[2,3],\"data_offsets\":[0,24]},"
-        "\"scalar\":{\"dtype\":\"BF16\",\"shape\":[],\"data_offsets\":[24,26]}}";
+        "{\"scalar\":{\"dtype\":\"BF16\",\"shape\":[],\"data_offsets\":[24,26]},"
+        "\"x\":{\"dtype\":\"F32\",\"shape\":[2,3],\"data_offsets\":[0,24]}}";
     uint64_t length = sizeof(header_json) - 1;
     unsigned char prefix[8];
     for (unsigned index = 0; index < 8; index++) prefix[index] = (unsigned char)(length >> (8 * index));
@@ -292,6 +302,272 @@ static void test_safetensors(void) {
     CHECK(h3_st_tensor_elements(scalar) == 1);
     h3_st_free_header(&header);
     CHECK(unlink(path) == 0);
+
+    char overlap_path[] = "/tmp/h3_safetensors_overlap_XXXXXX";
+    descriptor = mkstemp(overlap_path);
+    CHECK(descriptor >= 0);
+    const char overlap_json[] =
+        "{\"x\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]},"
+        "\"y\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[2,6]}}";
+    length = sizeof(overlap_json) - 1;
+    for (unsigned index = 0; index < 8; index++)
+        prefix[index] = (unsigned char)(length >> (8 * index));
+    unsigned char overlap_payload[6] = {0};
+    write_all(descriptor, prefix, sizeof(prefix));
+    write_all(descriptor, overlap_json, (size_t)length);
+    write_all(descriptor, overlap_payload, sizeof(overlap_payload));
+    CHECK(close(descriptor) == 0);
+    CHECK(!h3_st_read_header(overlap_path, &header, error, sizeof(error)));
+    CHECK(unlink(overlap_path) == 0);
+}
+
+static void write_file(const char *path, const void *data, size_t size) {
+    int descriptor = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    CHECK(descriptor >= 0);
+    write_all(descriptor, data, size);
+    CHECK(close(descriptor) == 0);
+}
+
+static void set_mtime(const char *path, long seconds) {
+    struct timeval times[2] = {{seconds, 0}, {seconds, 0}};
+    CHECK(utimes(path, times) == 0);
+}
+
+static int exists(const char *path) {
+    return access(path, F_OK) == 0;
+}
+
+static void test_dit_cache(void) {
+    char root[] = "/tmp/h3_dit_cache_XXXXXX";
+    CHECK(mkdtemp(root) != NULL);
+    char checkpoint[256], shard[320], notes[320], shader[256];
+    char directory[256];
+    snprintf(checkpoint, sizeof(checkpoint), "%s/transformer", root);
+    snprintf(shard, sizeof(shard), "%s/model-00001.safetensors", checkpoint);
+    snprintf(notes, sizeof(notes), "%s/README.md", checkpoint);
+    snprintf(shader, sizeof(shader), "%s/h3_shaders.metal", root);
+    snprintf(directory, sizeof(directory), "%s/cache", root);
+    CHECK(mkdir(checkpoint, 0700) == 0);
+    unsigned char shard_bytes[16] = {1, 2, 3};
+    write_file(shard, shard_bytes, sizeof(shard_bytes));
+    set_mtime(shard, 1700000000);
+    const char kernel_source[] = "kernel void h3_test() {}\n";
+    write_file(shader, kernel_source, sizeof(kernel_source) - 1);
+    const char *m5 = "Apple M5 Ultra|tensor-ops=1:3";
+
+    /* The cache directory is created private. */
+    h3_dit_cache cache;
+    CHECK(h3_dit_cache_init(&cache, directory, checkpoint, m5, shader));
+    struct stat info;
+    CHECK(stat(directory, &info) == 0 && S_ISDIR(info.st_mode));
+    CHECK((info.st_mode & 0777) == 0700);
+    CHECK(!h3_dit_cache_init(&cache, shard, checkpoint, m5, shader));
+    CHECK(h3_dit_cache_init(&cache, directory, checkpoint, m5, shader));
+
+    /* Checkpoint fingerprint: stable, sensitive to shard mtime, size and
+     * names, blind to non-shard files. */
+    uint64_t fingerprint = h3_dit_cache_checkpoint_fingerprint(checkpoint);
+    CHECK(fingerprint == cache.checkpoint);
+    CHECK(fingerprint == h3_dit_cache_checkpoint_fingerprint(checkpoint));
+    set_mtime(shard, 1700000001);
+    uint64_t touched = h3_dit_cache_checkpoint_fingerprint(checkpoint);
+    CHECK(touched != fingerprint);
+    set_mtime(shard, 1700000000);
+    CHECK(h3_dit_cache_checkpoint_fingerprint(checkpoint) == fingerprint);
+    unsigned char grown[17] = {1, 2, 3};
+    write_file(shard, grown, sizeof(grown));
+    set_mtime(shard, 1700000000);
+    uint64_t resized = h3_dit_cache_checkpoint_fingerprint(checkpoint);
+    CHECK(resized != fingerprint && resized != touched);
+    write_file(shard, shard_bytes, sizeof(shard_bytes));
+    set_mtime(shard, 1700000000);
+    CHECK(h3_dit_cache_checkpoint_fingerprint(checkpoint) == fingerprint);
+    write_file(notes, "notes", 5);
+    CHECK(h3_dit_cache_checkpoint_fingerprint(checkpoint) == fingerprint);
+    CHECK(unlink(notes) == 0);
+    char renamed[320];
+    snprintf(renamed, sizeof(renamed), "%s/model-00002.safetensors",
+             checkpoint);
+    CHECK(rename(shard, renamed) == 0);
+    CHECK(h3_dit_cache_checkpoint_fingerprint(checkpoint) != fingerprint);
+    CHECK(rename(renamed, shard) == 0);
+    CHECK(h3_dit_cache_checkpoint_fingerprint(checkpoint) == fingerprint);
+
+    /* The kernel variant follows the device/TensorOps mode and the shader
+     * content, not the shader path's mtime. */
+    h3_dit_cache other;
+    CHECK(h3_dit_cache_init(&other, directory, checkpoint,
+                            "Apple M3 Max|tensor-ops=0:0", shader));
+    CHECK(other.checkpoint == cache.checkpoint);
+    CHECK(other.source == cache.source);
+    CHECK(other.variant != cache.variant);
+    set_mtime(shader, 1600000000);
+    CHECK(h3_dit_cache_init(&other, directory, checkpoint, m5, shader));
+    CHECK(other.variant == cache.variant);
+    write_file(shader, "kernel void h3_other() {}\n", 26);
+    CHECK(h3_dit_cache_init(&other, directory, checkpoint, m5, shader));
+    CHECK(other.variant != cache.variant);
+
+    /* int8 keys: one per block (layer) and stored-matrix set. */
+    const unsigned all = 0xFu;
+    uint64_t key = h3_dit_cache_int8_key(&cache, 7, all);
+    CHECK(key == h3_dit_cache_int8_key(&cache, 7, all));
+    CHECK(key != h3_dit_cache_int8_key(&cache, 8, all));
+    CHECK(key != h3_dit_cache_int8_key(&cache, 7, 0xCu));
+    other = cache;
+    other.checkpoint ^= 1;
+    CHECK(key != h3_dit_cache_int8_key(&other, 7, all));
+    other = cache;
+    other.variant ^= 1;
+    CHECK(key != h3_dit_cache_int8_key(&other, 7, all));
+
+    /* AdaLN keys: steps, every used sigma bit and both condition flags. */
+    h3_sigma_schedule standard, turbo, nudged;
+    CHECK(h3_serving_schedule_build(20, &standard));
+    CHECK(h3_serving_schedule_build(6, &turbo));
+    uint64_t adaln = h3_dit_cache_adaln_key(&cache, &standard, 1, 0);
+    CHECK(adaln == h3_dit_cache_adaln_key(&cache, &standard, 1, 0));
+    CHECK(adaln != h3_dit_cache_adaln_key(&cache, &turbo, 1, 0));
+    CHECK(adaln != h3_dit_cache_adaln_key(&cache, &standard, 0, 0));
+    CHECK(adaln != h3_dit_cache_adaln_key(&cache, &standard, 1, 1));
+    CHECK(adaln != h3_dit_cache_int8_key(&cache, 7, all));
+    nudged = standard;
+    nudged.video[3] = nextafterf(nudged.video[3], 2.0f);
+    CHECK(adaln != h3_dit_cache_adaln_key(&cache, &nudged, 1, 0));
+    nudged = standard;
+    nudged.audio[19] = nextafterf(nudged.audio[19], 2.0f);
+    CHECK(adaln != h3_dit_cache_adaln_key(&cache, &nudged, 1, 0));
+    nudged = standard;
+    nudged.video[25] = 0.5f;
+    CHECK(adaln == h3_dit_cache_adaln_key(&cache, &nudged, 1, 0));
+    other = cache;
+    other.checkpoint ^= 1;
+    CHECK(adaln != h3_dit_cache_adaln_key(&other, &standard, 1, 0));
+
+    char path[1200], adaln_path[1200];
+    CHECK(h3_dit_cache_int8_path(&cache, 7, key, path, sizeof(path)));
+    CHECK(!strncmp(path, directory, strlen(directory)));
+    CHECK(strstr(path, "-int8-b07-") != NULL);
+    CHECK(!h3_dit_cache_int8_path(&cache, 7, key, path, 16));
+    CHECK(h3_dit_cache_int8_path(&cache, 7, key, path, sizeof(path)));
+    CHECK(h3_dit_cache_adaln_path(&cache, 20, adaln, adaln_path,
+                                  sizeof(adaln_path)));
+    CHECK(strstr(adaln_path, "-adaln-s20-") != NULL);
+
+    /* Layout: page-aligned payloads and file end. */
+    const uint64_t sizes[3] = {100, 20000, 7};
+    h3_dit_cache_header header, expected;
+    CHECK(h3_dit_cache_header_init(&header, H3_DIT_CACHE_INT8, key, sizes,
+                                   3));
+    CHECK(header.entry_count == 3);
+    CHECK(header.entries[0].offset == H3_DIT_CACHE_ALIGN);
+    CHECK(header.entries[1].offset == 2 * H3_DIT_CACHE_ALIGN);
+    CHECK(header.entries[2].offset == 4 * H3_DIT_CACHE_ALIGN);
+    CHECK(header.file_bytes == 5 * H3_DIT_CACHE_ALIGN);
+    CHECK(!h3_dit_cache_header_init(&expected, H3_DIT_CACHE_INT8, key, sizes,
+                                    0));
+    const uint64_t empty[2] = {100, 0};
+    CHECK(!h3_dit_cache_header_init(&expected, H3_DIT_CACHE_INT8, key, empty,
+                                    2));
+
+    /* Atomic private write, then validation against the reader's
+     * expectation. */
+    unsigned char first[100], second[20000], third[7];
+    for (size_t index = 0; index < sizeof(first); index++)
+        first[index] = (unsigned char)index;
+    for (size_t index = 0; index < sizeof(second); index++)
+        second[index] = (unsigned char)(index * 7 + 1);
+    memset(third, 0xA5, sizeof(third));
+    const void *payloads[3] = {first, second, third};
+    char error[256];
+    CHECK(!h3_dit_cache_valid(path, &header));
+    CHECK(h3_dit_cache_write(path, &header, payloads, error, sizeof(error)));
+    CHECK(h3_dit_cache_valid(path, &header));
+    CHECK(stat(path, &info) == 0);
+    CHECK((info.st_mode & 0777) == 0600);
+    CHECK((uint64_t)info.st_size == header.file_bytes);
+    char temp[1300];
+    snprintf(temp, sizeof(temp), "%s.tmp.%d", path, (int)getpid());
+    CHECK(!exists(temp));
+    int descriptor = open(path, O_RDONLY);
+    CHECK(descriptor >= 0);
+    unsigned char readback[20000];
+    CHECK(pread(descriptor, readback, sizeof(readback),
+                (off_t)header.entries[1].offset) == (ssize_t)sizeof(readback));
+    CHECK(!memcmp(readback, second, sizeof(second)));
+    CHECK(close(descriptor) == 0);
+
+    expected = header;
+    expected.key ^= 1;
+    CHECK(!h3_dit_cache_valid(path, &expected));
+    const uint64_t resized_entry[3] = {100, 20000, 8};
+    CHECK(h3_dit_cache_header_init(&expected, H3_DIT_CACHE_INT8, key,
+                                   resized_entry, 3));
+    CHECK(!h3_dit_cache_valid(path, &expected));
+    CHECK(h3_dit_cache_header_init(&expected, H3_DIT_CACHE_ADALN, key, sizes,
+                                   3));
+    CHECK(!h3_dit_cache_valid(path, &expected));
+
+    /* A corrupt or truncated file is rejected. */
+    descriptor = open(path, O_RDWR);
+    CHECK(descriptor >= 0);
+    const size_t corrupt_offsets[] = {0, 8,
+        offsetof(h3_dit_cache_header, key),
+        offsetof(h3_dit_cache_header, entries) + 16};
+    for (size_t index = 0;
+         index < sizeof(corrupt_offsets) / sizeof(*corrupt_offsets); index++) {
+        unsigned char byte = 0;
+        off_t at = (off_t)corrupt_offsets[index];
+        CHECK(pread(descriptor, &byte, 1, at) == 1);
+        unsigned char flipped = (unsigned char)(byte ^ 0x40);
+        CHECK(pwrite(descriptor, &flipped, 1, at) == 1);
+        CHECK(!h3_dit_cache_valid(path, &header));
+        CHECK(pwrite(descriptor, &byte, 1, at) == 1);
+        CHECK(h3_dit_cache_valid(path, &header));
+    }
+    CHECK(ftruncate(descriptor, (off_t)header.file_bytes - 1) == 0);
+    CHECK(!h3_dit_cache_valid(path, &header));
+    CHECK(ftruncate(descriptor, 64) == 0);
+    CHECK(!h3_dit_cache_valid(path, &header));
+    CHECK(close(descriptor) == 0);
+    CHECK(h3_dit_cache_write(path, &header, payloads, error, sizeof(error)));
+    CHECK(h3_dit_cache_valid(path, &header));
+
+    /* Pruning removes superseded files of this block and temporaries of dead
+     * writers only. */
+    char stale[1200], other_block[1200], dead_temp[1300], live_temp[1300];
+    CHECK(h3_dit_cache_int8_path(&cache, 7, key ^ 1, stale, sizeof(stale)));
+    CHECK(h3_dit_cache_int8_path(&cache, 8, key, other_block,
+                                 sizeof(other_block)));
+    pid_t child = fork();
+    CHECK(child >= 0);
+    if (child == 0) _exit(0);
+    CHECK(waitpid(child, NULL, 0) == child);
+    snprintf(dead_temp, sizeof(dead_temp), "%s.tmp.%d", stale, (int)child);
+    snprintf(live_temp, sizeof(live_temp), "%s.tmp.%d", stale,
+             (int)getpid());
+    write_file(stale, "x", 1);
+    write_file(other_block, "x", 1);
+    write_file(dead_temp, "x", 1);
+    write_file(live_temp, "x", 1);
+    write_file(adaln_path, "x", 1);
+    h3_dit_cache_prune_int8(&cache, 7, path);
+    CHECK(exists(path));
+    CHECK(!exists(stale));
+    CHECK(!exists(dead_temp));
+    CHECK(exists(live_temp));
+    CHECK(exists(other_block));
+    CHECK(exists(adaln_path));
+
+    CHECK(unlink(path) == 0);
+    CHECK(unlink(live_temp) == 0);
+    CHECK(unlink(other_block) == 0);
+    CHECK(unlink(adaln_path) == 0);
+    CHECK(rmdir(directory) == 0);
+    CHECK(unlink(shard) == 0);
+    CHECK(rmdir(checkpoint) == 0);
+    CHECK(unlink(shader) == 0);
+    CHECK(rmdir(root) == 0);
 }
 
 static void test_rng_and_solver(void) {
@@ -396,6 +672,180 @@ static void test_terminal_zoom(void) {
     CHECK(!h3_terminal_display_dimensions(INT32_MAX, 1, &width, &height));
 }
 
+static int reflect_index(int coordinate, int length) {
+    if (coordinate < 0) return -coordinate;
+    if (coordinate >= length) return 2 * length - coordinate - 2;
+    return coordinate;
+}
+
+static float synthetic_value(uint32_t index, uint32_t salt) {
+    uint32_t state = index * 2654435761u + salt * 40503u + 12345u;
+    state ^= state >> 13;
+    return (float)((int)(state % 2001u) - 1000) / 337.0f;
+}
+
+/* A one-frame causal Conv3d (kernel-1 zero front frames, reflect spatial
+ * padding, any temporal stride) must equal the Conv2d over its last temporal
+ * tap exactly: the dropped taps only ever multiply the zero front frames. */
+static void check_single_frame_conv(uint32_t kernel, uint32_t stride_t,
+                                    uint32_t stride, uint32_t pad_before,
+                                    uint32_t pad_after) {
+    enum { IN = 3, OUT = 4, H = 6, W = 7 };
+    uint32_t front = kernel - 1;
+    uint32_t padded_d = 1 + front;
+    uint32_t padded_h = H + pad_before + pad_after;
+    uint32_t padded_w = W + pad_before + pad_after;
+    CHECK((padded_d - kernel) / stride_t + 1 == 1);
+    uint32_t out_h = (padded_h - kernel) / stride + 1;
+    uint32_t out_w = (padded_w - kernel) / stride + 1;
+    size_t taps = (size_t)kernel * kernel * kernel;
+    float *input = malloc((size_t)H * W * IN * sizeof(*input));
+    float *weight = malloc((size_t)OUT * IN * taps * sizeof(*weight));
+    float *planar = malloc((size_t)OUT * IN * kernel * kernel *
+                           sizeof(*planar));
+    float *volume = calloc((size_t)padded_d * padded_h * padded_w * IN,
+                           sizeof(*volume));
+    float bias[OUT];
+    CHECK(input && weight && planar && volume);
+    for (uint32_t index = 0; index < (uint32_t)(H * W * IN); index++)
+        input[index] = synthetic_value(index, 1);
+    for (uint32_t index = 0; index < (uint32_t)(OUT * IN * taps); index++)
+        weight[index] = synthetic_value(index, 2);
+    for (uint32_t index = 0; index < OUT; index++)
+        bias[index] = synthetic_value(index, 3);
+    h3_video_encoder_slice_tap_f32(weight, OUT, IN, kernel, kernel - 1, planar);
+    for (uint32_t pair = 0; pair < OUT * IN; pair++)
+        for (uint32_t tap = 0; tap < kernel * kernel; tap++)
+            CHECK(planar[pair * kernel * kernel + tap] ==
+                  weight[(pair * kernel + kernel - 1) * kernel * kernel + tap]);
+    /* The real frame follows `front` zero frames, as h3_vae_encoder_pad_f32. */
+    for (uint32_t y = 0; y < padded_h; y++)
+        for (uint32_t x = 0; x < padded_w; x++)
+            for (uint32_t channel = 0; channel < IN; channel++) {
+                int source_y = reflect_index((int)y - (int)pad_before, H);
+                int source_x = reflect_index((int)x - (int)pad_before, W);
+                volume[(((size_t)front * padded_h + y) * padded_w + x) * IN +
+                       channel] =
+                    input[((size_t)source_y * W + (size_t)source_x) * IN +
+                          channel];
+            }
+    const float *plane = volume + (size_t)front * padded_h * padded_w * IN;
+    for (uint32_t y = 0; y < out_h; y++)
+        for (uint32_t x = 0; x < out_w; x++)
+            for (uint32_t output = 0; output < OUT; output++) {
+                float full = bias[output], sliced = bias[output];
+                for (uint32_t kd = 0; kd < kernel; kd++)
+                    for (uint32_t kh = 0; kh < kernel; kh++)
+                        for (uint32_t kw = 0; kw < kernel; kw++)
+                            for (uint32_t channel = 0; channel < IN; channel++)
+                                full += volume[(((size_t)kd * padded_h +
+                                    y * stride + kh) * padded_w +
+                                    x * stride + kw) * IN + channel] *
+                                    weight[((((size_t)output * IN + channel) *
+                                    kernel + kd) * kernel + kh) * kernel + kw];
+                for (uint32_t kh = 0; kh < kernel; kh++)
+                    for (uint32_t kw = 0; kw < kernel; kw++)
+                        for (uint32_t channel = 0; channel < IN; channel++)
+                            sliced += plane[(((size_t)y * stride + kh) *
+                                padded_w + x * stride + kw) * IN + channel] *
+                                planar[(((size_t)output * IN + channel) *
+                                kernel + kh) * kernel + kw];
+                CHECK(full == sliced);
+            }
+    free(input);
+    free(weight);
+    free(planar);
+    free(volume);
+}
+
+static void test_video_encoder_single_frame_conv(void) {
+    check_single_frame_conv(3, 1, 1, 1, 1);
+    check_single_frame_conv(3, 2, 2, 0, 1);
+    check_single_frame_conv(3, 1, 2, 0, 1);
+    check_single_frame_conv(1, 1, 1, 0, 0);
+}
+
+static void test_video_vae_assembly(void) {
+    char error[256] = {0};
+    int ok = h3_video_vae_assembly_selftest(error, sizeof(error));
+    if (!ok) fprintf(stderr, "VAE assembly: %s\n", error);
+    CHECK(ok);
+}
+
+static void *read_file(const char *path, size_t *size) {
+    FILE *file = fopen(path, "rb");
+    if (!file) return NULL;
+    fseek(file, 0, SEEK_END);
+    long end = ftell(file);
+    fseek(file, 0, SEEK_SET);
+    void *data = end > 0 ? malloc((size_t)end) : NULL;
+    if (data && fread(data, 1, (size_t)end, file) != (size_t)end) {
+        free(data);
+        data = NULL;
+    }
+    fclose(file);
+    *size = data ? (size_t)end : 0;
+    return data;
+}
+
+/* Needs an FFmpeg with libx264; runs only when H3_FFMPEG names one. The
+ * streamed writer, fed in uneven runs with pauses, must produce the same
+ * file bytes as the whole-buffer writer, and abort must leave no file. */
+static void test_ffmpeg_stream(void) {
+    const char *ffmpeg = getenv("H3_FFMPEG");
+    if (!ffmpeg || !*ffmpeg) {
+        printf("skip: FFmpeg stream test (set H3_FFMPEG)\n");
+        return;
+    }
+    enum { FRAMES = 22, W = 64, H = 48, RATE = 32000, SAMPLES = RATE };
+    size_t frame_bytes = (size_t)W * H * 3;
+    uint8_t *frames = malloc(FRAMES * frame_bytes);
+    float *pcm = malloc(2 * SAMPLES * sizeof(*pcm));
+    CHECK(frames && pcm);
+    for (size_t index = 0; index < FRAMES * frame_bytes; index++)
+        frames[index] = (uint8_t)((index * 2654435761u) >> 24);
+    for (size_t index = 0; index < 2 * SAMPLES; index++)
+        pcm[index] = sinf((float)index * 0.01f) * 0.25f;
+    char directory[] = "/tmp/h3-ffmpeg-test-XXXXXX";
+    CHECK(mkdtemp(directory) != NULL);
+    char whole[256], streamed[256], aborted[256];
+    snprintf(whole, sizeof(whole), "%s/whole.mp4", directory);
+    snprintf(streamed, sizeof(streamed), "%s/streamed.mp4", directory);
+    snprintf(aborted, sizeof(aborted), "%s/aborted.mp4", directory);
+    char error[256];
+    CHECK(h3_ffmpeg_write_av_rgb24_f32(whole, frames, FRAMES, W, H, 24, pcm,
+                                       SAMPLES, 2, RATE, error,
+                                       sizeof(error)));
+    h3_ffmpeg_av_stream *stream = h3_ffmpeg_av_stream_open(
+        streamed, frames, FRAMES, W, H, 24, pcm, SAMPLES, 2, RATE, error,
+        sizeof(error));
+    CHECK(stream != NULL);
+    const int runs[] = {17, 17, 22};
+    for (size_t index = 0; index < sizeof(runs) / sizeof(*runs); index++) {
+        usleep(50000);
+        h3_ffmpeg_av_stream_ready(stream, runs[index]);
+    }
+    CHECK(h3_ffmpeg_av_stream_finish(stream, error, sizeof(error)));
+    size_t whole_size = 0, streamed_size = 0;
+    uint8_t *whole_bytes = read_file(whole, &whole_size);
+    uint8_t *streamed_bytes = read_file(streamed, &streamed_size);
+    CHECK(whole_bytes && streamed_bytes && whole_size == streamed_size);
+    CHECK(memcmp(whole_bytes, streamed_bytes, whole_size) == 0);
+    stream = h3_ffmpeg_av_stream_open(aborted, frames, FRAMES, W, H, 24, pcm,
+                                      SAMPLES, 2, RATE, error, sizeof(error));
+    CHECK(stream != NULL);
+    h3_ffmpeg_av_stream_ready(stream, 17);
+    h3_ffmpeg_av_stream_abort(stream);
+    CHECK(!exists(aborted));
+    unlink(whole);
+    unlink(streamed);
+    CHECK(rmdir(directory) == 0);   /* so no partial file was left behind */
+    free(whole_bytes);
+    free(streamed_bytes);
+    free(frames);
+    free(pcm);
+}
+
 int main(void) {
     test_temporal_and_canvas();
     test_schedule();
@@ -404,11 +854,15 @@ int main(void) {
     test_layout_fl2va();
     test_layout_ref2va();
     test_safetensors();
+    test_dit_cache();
     test_rng_and_solver();
     test_rgb_resize();
     test_dit_row_conversions();
     test_metal_probe();
     test_terminal_zoom();
+    test_video_encoder_single_frame_conv();
+    test_video_vae_assembly();
+    test_ffmpeg_stream();
     printf("ok: %d checks\n", tests_run);
     return 0;
 }

@@ -30,6 +30,13 @@ typedef struct {
     /* Root MTLCommandBuffer timestamps; MPSGraph may schedule child buffers,
      * so command_wait_seconds is the complete turnaround measurement. */
     double gpu_seconds;
+    /* Root buffers MPSGraph committed itself (commitAndContinue), the wall
+     * spent inside MPSGraph encodes and inside h3_gpu_continue's new command
+     * buffer; the last two include blocking at the queue's uncompleted
+     * command buffer limit (see H3_GPU_QUEUE_DEPTH). */
+    uint64_t mps_commits;
+    double mps_encode_seconds;
+    double command_create_seconds;
 } h3_gpu_stats;
 
 h3_gpu *h3_gpu_create(const char *shader_source_path,
@@ -38,6 +45,10 @@ void h3_gpu_free(h3_gpu *gpu);
 int h3_gpu_is_m5(const h3_gpu *gpu);
 int h3_gpu_has_nax_mlp(const h3_gpu *gpu);
 int h3_gpu_has_int8_mlp(const h3_gpu *gpu);
+/* Describe everything about this context that selects kernel code: device
+ * name and the TensorOps compile/mode choice. Persistent caches of
+ * GPU-derived weights key on it. */
+int h3_gpu_describe(const h3_gpu *gpu, char *buffer, size_t size);
 
 h3_gpu_tensor *h3_gpu_tensor_new_f32(h3_gpu *gpu, size_t elements);
 h3_gpu_tensor *h3_gpu_tensor_new_bf16(h3_gpu *gpu, size_t elements);
@@ -53,6 +64,12 @@ h3_gpu_tensor *h3_gpu_tensor_load_bf16(h3_gpu *gpu, const char *path,
                                        uint64_t file_offset, size_t elements);
 h3_gpu_tensor *h3_gpu_tensor_load_f32(h3_gpu *gpu, const char *path,
                                       uint64_t file_offset, size_t elements);
+/* Load a payload from a derived-weight cache file (H3_DIT_CACHE) with the same
+ * policy as transformer weights: zero-copy file mapping on M5, a copied buffer
+ * otherwise or with H3_ZERO_COPY_WEIGHTS=0. */
+h3_gpu_tensor *h3_gpu_tensor_load_cache(h3_gpu *gpu, const char *path,
+                                        uint64_t file_offset, size_t elements,
+                                        h3_gpu_dtype dtype);
 /* Fill an existing shared BF16 buffer from a file. The tensor and its
  * accounting are unchanged, so this may run on an I/O thread while another
  * tensor is in flight on the GPU. */
@@ -68,6 +85,10 @@ int h3_gpu_tensor_stream_file_bf16(h3_gpu_tensor *tensor, const char *path,
 void h3_gpu_tensor_free(h3_gpu_tensor *tensor);
 size_t h3_gpu_tensor_elements(const h3_gpu_tensor *tensor);
 h3_gpu_dtype h3_gpu_tensor_dtype(const h3_gpu_tensor *tensor);
+size_t h3_gpu_tensor_bytes(const h3_gpu_tensor *tensor);
+/* Host view of shared storage, valid once the producing command buffer has
+ * completed (h3_gpu_submit). */
+const void *h3_gpu_tensor_contents(const h3_gpu_tensor *tensor);
 int h3_gpu_tensor_read_f32(const h3_gpu_tensor *tensor, float *values,
                            size_t elements);
 int h3_gpu_tensor_read_f32_range(const h3_gpu_tensor *tensor,
@@ -91,6 +112,10 @@ int h3_gpu_begin(h3_gpu *gpu);
  * the same ordered queue. h3_gpu_submit() waits and validates the whole chain. */
 int h3_gpu_continue(h3_gpu *gpu);
 int h3_gpu_submit(h3_gpu *gpu);
+/* Wait for the oldest buffer committed by h3_gpu_continue() and retire it from
+ * the chain, leaving the newer ones running. Because the queue is ordered, its
+ * outputs are then final while the GPU works on the later buffers. */
+int h3_gpu_wait_oldest(h3_gpu *gpu);
 const char *h3_gpu_error(const h3_gpu *gpu);
 int h3_gpu_get_stats(const h3_gpu *gpu, h3_gpu_stats *stats);
 /* Optional benchmark labels. With H3_PROFILE set, marks and context teardown
@@ -128,6 +153,11 @@ int h3_gpu_cast_f32_to_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                             const h3_gpu_tensor *input, uint32_t elements);
 int h3_gpu_cast_bf16_to_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                             const h3_gpu_tensor *input, uint32_t elements);
+/* output[r,c] = F32(input[r,c]) + bias[c]; input BF16, bias/output F32. */
+int h3_gpu_bias_bf16_to_f32(h3_gpu *gpu, h3_gpu_tensor *output,
+                            const h3_gpu_tensor *input,
+                            const h3_gpu_tensor *bias, uint32_t rows,
+                            uint32_t width);
 int h3_gpu_copy_bf16(h3_gpu *gpu, h3_gpu_tensor *destination,
                      size_t destination_offset,
                      const h3_gpu_tensor *source, size_t source_offset,
@@ -136,6 +166,11 @@ int h3_gpu_copy_f32(h3_gpu *gpu, h3_gpu_tensor *destination,
                     size_t destination_offset,
                     const h3_gpu_tensor *source, size_t source_offset,
                     size_t elements);
+/* Reference each tensor from a 4-byte blit so this command buffer makes the
+ * whole allocation GPU-resident. Zero-copy file mappings are then faulted in
+ * and wired during a load rather than by the first forward. Reads only. */
+int h3_gpu_make_resident(h3_gpu *gpu, h3_gpu_tensor *const *tensors,
+                         size_t count);
 int h3_gpu_rms_norm_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                         const h3_gpu_tensor *input,
                         const h3_gpu_tensor *weight, uint32_t rows,
@@ -187,6 +222,39 @@ int h3_gpu_video_qkv_rope_f32(h3_gpu *gpu, h3_gpu_tensor *query,
                               uint32_t sequence, uint32_t heads,
                               uint32_t head_dim, uint32_t rope_half,
                               float epsilon);
+/* Fused epilogues of the low-precision video VAE block. Each one performs the
+ * per-element arithmetic of the separate kernels it replaces (BF16 widening,
+ * F32 bias, norm/RoPE/SwiGLU/residual, BF16 rounding) in the same order, so the
+ * results are bit-identical; only the F32 round trips through memory go. */
+/* output_bf16 = BF16(RMSNorm_f32(input) * weight), as rms_norm_f32 + cast. */
+int h3_gpu_rms_norm_f32_to_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                                const h3_gpu_tensor *input,
+                                const h3_gpu_tensor *weight, uint32_t rows,
+                                uint32_t width, float epsilon);
+/* As bias_bf16_to_f32 over the fused [rows, 3 * heads * head_dim] QKV, then
+ * video_qkv_rope_f32, then a BF16 cast of query, key and value. */
+int h3_gpu_video_qkv_bias_rope_bf16(h3_gpu *gpu, h3_gpu_tensor *query,
+                                    h3_gpu_tensor *key, h3_gpu_tensor *value,
+                                    const h3_gpu_tensor *qkv,
+                                    const h3_gpu_tensor *bias,
+                                    const h3_gpu_tensor *rope_cos,
+                                    const h3_gpu_tensor *rope_sin,
+                                    uint32_t sequence, uint32_t heads,
+                                    uint32_t head_dim, uint32_t rope_half,
+                                    float epsilon);
+/* As bias_bf16_to_f32 over [rows, 2 * width], swiglu_f32 and a BF16 cast. */
+int h3_gpu_bias_swiglu_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                            const h3_gpu_tensor *fused,
+                            const h3_gpu_tensor *bias, uint32_t rows,
+                            uint32_t width);
+/* As bias_bf16_to_f32 then scale_add_f32: output = residual + (F32(branch) +
+ * bias) * scale. output may alias residual. */
+int h3_gpu_bias_scale_add_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                               const h3_gpu_tensor *residual,
+                               const h3_gpu_tensor *branch,
+                               const h3_gpu_tensor *bias,
+                               const h3_gpu_tensor *scale, uint32_t rows,
+                               uint32_t width);
 
 /* H3 AudioVAE uses time-major [batch,length,channels] activations and stores
  * Conv1d/ConvTranspose1d weights in PyTorch OIK/IOK order respectively. */
@@ -277,6 +345,16 @@ int h3_gpu_conv3d_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                       uint32_t input_channels, uint32_t output_channels,
                       uint32_t kernel_depth, uint32_t kernel_height,
                       uint32_t kernel_width, uint32_t stride_depth,
+                      uint32_t stride_height, uint32_t stride_width);
+/* Valid (unpadded) NHWC Conv2d with OIHW weights; the single-frame visual
+ * encoder path supplies explicitly reflect-padded input. */
+int h3_gpu_conv2d_f32(h3_gpu *gpu, h3_gpu_tensor *output,
+                      const h3_gpu_tensor *input,
+                      const h3_gpu_tensor *weight,
+                      const h3_gpu_tensor *bias, uint32_t batch,
+                      uint32_t height, uint32_t width,
+                      uint32_t input_channels, uint32_t output_channels,
+                      uint32_t kernel_height, uint32_t kernel_width,
                       uint32_t stride_height, uint32_t stride_width);
 int h3_gpu_vae_encoder_group_norm_silu_f32(
                       h3_gpu *gpu, h3_gpu_tensor *output,
