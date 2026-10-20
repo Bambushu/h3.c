@@ -1408,9 +1408,12 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     } else {
         if (params->first_frame) {
             keyframes[keyframe_count++] = 0;
+            /* Center-crop to the render aspect ratio instead of stretching,
+             * matching last_frame below - an input whose aspect differs
+             * from render_width/render_height no longer gets squashed. */
             if (!h3_ffmpeg_read_image_f32(
                     params->first_frame, render_width, render_height,
-                    H3_IMAGE_FIT_STRETCH, &condition_pixels[visual_count],
+                    H3_IMAGE_FIT_COVER, &condition_pixels[visual_count],
                     detail, sizeof(detail))) {
                 h3_set_error(ctx, "%s", detail);
                 goto cleanup;
