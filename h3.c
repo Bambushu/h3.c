@@ -1317,7 +1317,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             const h3_reference *reference = &params->references[index];
             const char *audio_path = NULL;
             int truncate = 0;
-            int max_samples = 32000 * 15;
+            int max_samples = H3_REFERENCE_AUDIO_MAX_SAMPLES;
             if (reference->kind == H3_REFERENCE_AUDIO) {
                 audio_path = reference->path;
             } else if (reference->kind == H3_REFERENCE_VIDEO_AUDIO) {
@@ -1354,10 +1354,12 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
                 h3_set_error(ctx, "%s", detail);
                 goto cleanup;
             }
-            if ((size_t)samples > (size_t)32000 * 15 - total_audio_samples) {
+            if ((size_t)samples >
+                (size_t)H3_REFERENCE_AUDIO_MAX_SAMPLES - total_audio_samples) {
                 free(pcm);
                 h3_set_error(ctx,
-                    "ordered reference audio exceeds 15 seconds in total");
+                    "ordered reference audio exceeds %d seconds in total",
+                    H3_REFERENCE_AUDIO_MAX_SECONDS);
                 goto cleanup;
             }
             h3_audio_latent latent;

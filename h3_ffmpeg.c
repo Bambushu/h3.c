@@ -1,4 +1,5 @@
 #include "h3_ffmpeg.h"
+#include "h3.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -391,12 +392,12 @@ int h3_ffmpeg_read_audio_f32(const char *path, int max_samples,
                              int truncate_at_limit,
                              float **pcm, int *samples,
                              char *error, size_t error_size) {
-    enum { AUDIO_RATE = 32000, AUDIO_CHANNELS = 2, MIN_SAMPLES = 64000 };
+    enum { AUDIO_CHANNELS = 2, MIN_SAMPLES = 64000 };
     if (error && error_size) error[0] = '\0';
     if (pcm) *pcm = NULL;
     if (samples) *samples = 0;
     if (!path || !*path || !pcm || !samples || max_samples < MIN_SAMPLES ||
-        max_samples > AUDIO_RATE * 15 ||
+        max_samples > H3_REFERENCE_AUDIO_MAX_SAMPLES ||
         (truncate_at_limit != 0 && truncate_at_limit != 1)) {
         fail(error, error_size, "invalid FFmpeg audio input arguments");
         return 0;
@@ -412,8 +413,9 @@ int h3_ffmpeg_read_audio_f32(const char *path, int max_samples,
         return 0;
     }
     char duration[64];
-    double seconds = (double)max_samples / (double)AUDIO_RATE;
-    if (!truncate_at_limit) seconds += 1.0 / (double)AUDIO_RATE;
+    double seconds = (double)max_samples / (double)H3_REFERENCE_AUDIO_RATE;
+    if (!truncate_at_limit)
+        seconds += 1.0 / (double)H3_REFERENCE_AUDIO_RATE;
     snprintf(duration, sizeof(duration), "%.9f", seconds);
     int stream[2];
     if (pipe(stream) != 0) {
@@ -469,7 +471,8 @@ int h3_ffmpeg_read_audio_f32(const char *path, int max_samples,
     if (!truncate_at_limit && trailing > 0) {
         free(interleaved);
         fail(error, error_size,
-             "reference audio exceeds the 15 second total limit");
+             "reference audio exceeds the %d second total limit",
+             H3_REFERENCE_AUDIO_MAX_SECONDS);
         return 0;
     }
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0 ||
