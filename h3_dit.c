@@ -1643,6 +1643,9 @@ static int configure_sol_attention(h3_dit *dit,
         return 1;
     }
     if (!h3_gpu_has_sol_attention(dit->gpu)) {
+        fprintf(stderr, "h3: Sol-Attn probe: gpu=%s error=%s\n",
+                dit->gpu ? "present" : "NULL",
+                dit->gpu ? h3_gpu_error(dit->gpu) : "-");
         const char *strict = getenv("H3_SOL_ATTN_STRICT");
         if (strict && *strict && strcmp(strict, "0")) {
             fail(error, error_size,
