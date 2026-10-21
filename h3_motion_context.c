@@ -217,10 +217,11 @@ static int encode_video_file(h3_motion_context *context, const char *path,
                              void *audio_opaque,
                              char *error, size_t error_size) {
     float *pixels = NULL;
-    int frames = 0;
+    int frames = 0, clip_frames = 0;
     if (!h3_ffmpeg_read_video_tail_f32(path, render_width, render_height,
                                        context->frames, &pixels, &frames,
-                                       error, error_size)) return 0;
+                                       &clip_frames, error, error_size))
+        return 0;
     if (frames != context->frames) {
         free(pixels);
         fail(error, error_size, "motion context %s has only %d frames, %d are pinned",
@@ -288,7 +289,12 @@ static int encode_video_file(h3_motion_context *context, const char *path,
         free(rows);
         return 0;
     }
-    /* The last 0.917 s of sound, encoded as the reference-audio path does. */
+    /* The pinned sound is the last audio_t steps of the clip's own audio
+     * grid, round(frames x 5/3) steps of 800 samples, the window a context
+     * file pins. The stream runs past that grid (h3 decodes a third of a
+     * step beyond the last frame, and an AAC track decodes to whole codec
+     * frames), so the stream's own tail sat up to a step off the grid and
+     * its rows matched the true latents at cosine 0.71. */
     float *pcm = NULL;
     int samples = 0;
     if (!h3_ffmpeg_read_audio_f32(path, H3_REFERENCE_AUDIO_MAX_SAMPLES, 1,
@@ -297,14 +303,33 @@ static int encode_video_file(h3_motion_context *context, const char *path,
         free(rows);
         return 0;
     }
-    int want = (int)lround((double)context->frames * AUDIO_RATE / H3_FPS);
-    if (want > samples) {
-        fprintf(stderr, "h3: motion context %s has %.3f s of audio, shorter "
-                "than the %.3f s pinned; pinning what there is\n", path,
-                (double)samples / AUDIO_RATE, (double)want / AUDIO_RATE);
-        want = samples;
+    long grid_end = llround(H3_FRAME_RESCALE * (double)clip_frames) *
+                    AUDIO_SAMPLES_PER_STEP;
+    long want = (long)context->audio_t * AUDIO_SAMPLES_PER_STEP;
+    long start = grid_end - want;
+    if (grid_end > samples && samples >= H3_REFERENCE_AUDIO_MAX_SAMPLES) {
+        free(pcm);
+        free(rows);
+        fail(error, error_size, "motion context %s is longer than the %d s "
+             "of sound a video can carry; chain from its context file", path,
+             H3_REFERENCE_AUDIO_MAX_SAMPLES / AUDIO_RATE);
+        return 0;
     }
-    float *tail = malloc((size_t)2 * (size_t)want * sizeof(*tail));
+    if (start >= samples) {
+        free(pcm);
+        free(rows);
+        fail(error, error_size, "motion context %s has %.3f s of audio, none "
+             "under its last %d frames", path, (double)samples / AUDIO_RATE,
+             context->frames);
+        return 0;
+    }
+    long have = (samples < grid_end ? samples : grid_end) - start;
+    if (have < want)
+        fprintf(stderr, "h3: motion context %s has %.3f s of audio under its "
+                "last %d frames, %.3f s are pinned; the rest is silence\n",
+                path, (double)have / AUDIO_RATE, context->frames,
+                (double)want / AUDIO_RATE);
+    float *tail = calloc((size_t)2 * (size_t)want, sizeof(*tail));
     if (!tail) {
         free(pcm);
         free(rows);
@@ -313,12 +338,12 @@ static int encode_video_file(h3_motion_context *context, const char *path,
     }
     for (int channel = 0; channel < 2; channel++)
         memcpy(tail + (size_t)channel * want,
-               pcm + (size_t)channel * samples + (samples - want),
-               (size_t)want * sizeof(*tail));
+               pcm + (size_t)channel * samples + start,
+               (size_t)have * sizeof(*tail));
     free(pcm);
     h3_audio_latent audio;
     memset(&audio, 0, sizeof(audio));
-    ok = h3_audio_vae_encode(audio_vae_path, shader_source_path, tail, want,
+    ok = h3_audio_vae_encode(audio_vae_path, shader_source_path, tail, (int)want,
                              audio_progress, audio_opaque, &audio,
                              error, error_size);
     free(tail);

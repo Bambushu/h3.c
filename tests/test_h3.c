@@ -1092,14 +1092,14 @@ static void test_ffmpeg_video_tail(void) {
     CHECK(h3_ffmpeg_write_av_rgb24_f32(path, frames, FRAMES, W, H, 24, pcm,
                                        SAMPLES, 2, RATE, error, sizeof(error)));
     float *whole = NULL, *tail = NULL;
-    int whole_frames = 0, tail_frames = 0;
+    int whole_frames = 0, tail_frames = 0, total_frames = 0;
     CHECK(h3_ffmpeg_read_video_f32(path, W, H, FRAMES, &whole, &whole_frames,
                                    error, sizeof(error)));
     CHECK(h3_ffmpeg_read_video_tail_f32(path, W, H, 22, &tail, &tail_frames,
-                                        error, sizeof(error)));
+                                        &total_frames, error, sizeof(error)));
     /* The bounded reader snaps 30 frames down to 22 (frames 0..21); the
      * tail is frames 8..29, so the 14 shared frames must match exactly. */
-    CHECK(tail_frames == 22 && whole_frames == 22);
+    CHECK(tail_frames == 22 && whole_frames == 22 && total_frames == FRAMES);
     size_t area = (size_t)W * H;
     int same = whole && tail;
     for (int channel = 0; same && channel < 3; channel++)
@@ -1113,7 +1113,7 @@ static void test_ffmpeg_video_tail(void) {
     float *more = NULL;
     int more_frames = 0;
     CHECK(h3_ffmpeg_read_video_tail_f32(path, W, H, 40, &more, &more_frames,
-                                        error, sizeof(error)));
+                                        NULL, error, sizeof(error)));
     CHECK(more_frames == FRAMES);
     unlink(path);
     free(whole); free(tail); free(more); free(frames); free(pcm);

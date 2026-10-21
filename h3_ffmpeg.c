@@ -390,10 +390,12 @@ int h3_ffmpeg_read_video_f32(const char *path, int width, int height,
 
 int h3_ffmpeg_read_video_tail_f32(const char *path, int width, int height,
                                   int tail_frames, float **pixels, int *frames,
+                                  int *total_frames,
                                   char *error, size_t error_size) {
     if (error && error_size) error[0] = '\0';
     if (pixels) *pixels = NULL;
     if (frames) *frames = 0;
+    if (total_frames) *total_frames = 0;
     if (!path || !*path || !pixels || !frames || width < 1 || height < 1 ||
         tail_frames < 1 || (size_t)width > SIZE_MAX / (size_t)height) {
         fail(error, error_size, "invalid FFmpeg video tail arguments");
@@ -499,6 +501,7 @@ int h3_ffmpeg_read_video_tail_f32(const char *path, int width, int height,
     free(ring);
     *pixels = channel_major;
     *frames = (int)count;
+    if (total_frames) *total_frames = (int)total;
     return 1;
 }
 

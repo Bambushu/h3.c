@@ -27,9 +27,11 @@ int h3_ffmpeg_read_video_f32(const char *path, int width, int height,
                              char *error, size_t error_size);
 
 /* The last tail_frames decoded frames of a video, same canvas and layout as
- * h3_ffmpeg_read_video_f32; fewer when the video is shorter. */
+ * h3_ffmpeg_read_video_f32; fewer when the video is shorter. total_frames,
+ * when given, receives the length of the whole stream in frames. */
 int h3_ffmpeg_read_video_tail_f32(const char *path, int width, int height,
                                   int tail_frames, float **pixels, int *frames,
+                                  int *total_frames,
                                   char *error, size_t error_size);
 
 /* Decode the first audio stream as channel-major stereo F32 at 32 kHz.
