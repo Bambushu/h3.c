@@ -2606,6 +2606,14 @@ static int use_sol_attention(const h3_dit *dit, int step) {
     if (all_steps && *all_steps && strcmp(all_steps, "0")) return 1;
     int steps = h3_dit_schedule_steps(dit->schedule);
     if (steps < 3 || step < 0 || step >= steps) return 0;
+    /* H3_SOL_ATTN_DENSE_STEPS=N: the first N steps dense, every later step
+     * sparse, including the last. Unset keeps the 20%-90% window. */
+    const char *dense_steps = getenv("H3_SOL_ATTN_DENSE_STEPS");
+    if (dense_steps && *dense_steps) {
+        char *tail = NULL;
+        long n = strtol(dense_steps, &tail, 10);
+        if (tail != dense_steps && !*tail && n >= 0) return step >= n;
+    }
     int denominator = steps - 1;
     return step * 10 >= denominator * 2 &&
            step * 10 <= denominator * 9;
