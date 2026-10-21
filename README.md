@@ -108,11 +108,17 @@ rows that end at the join, so the model continues the motion and the sound
 rather than restaging them. The pinned head is then trimmed from the
 delivered clip: a `--seconds 5` continuation delivers 22 frames (0.917 s)
 less than requested, and the clips concatenate. `--motion-context` also
-accepts a finished video, whose tail is decoded and re-encoded with the
-released VAEs; measured on the bench shot that round trip lands the picture
-rows at cosine 0.97 to the true latents and the sound rows at 0.71, and the
-model restaged (a cut, r 0.82), where the context file continued (r 0.99).
-Chain through `--save-context` files. Both clips must share the canvas. Motion context cannot be combined with `--first-frame` or with
+accepts a finished video (a take rendered without `--save-context`): its
+last 22 frames are decoded and re-encoded with the released visual VAE, and
+the sound under them, the last 37 steps of the clip's own 40 Hz audio grid,
+with the audio VAE. Measured on the bench shot both routes continue the
+take: r 0.993 at the join from the context file, 0.994 from the MP4 (the
+first video build took the soundtrack's last 0.917 s instead, which an AAC
+track places most of a latent step late, and that cut: r 0.82). The video
+route costs about 100 s of VAE encode at 544x960 before the denoise and
+pins rows at cosine 0.97 to the true latents rather than the file's exact
+ones; a clip over 45 s needs its context file. Both clips must share the
+canvas. Motion context cannot be combined with `--first-frame` or with
 Ref2VA references; `--last-frame` still works. Keep links at 8 to 10
 seconds: in ComfyUI the same 22-frame pin held a 10 s join and lost a 15 s
 one. The head adds its rows to every attention step: 32% more denoise on the
