@@ -1820,9 +1820,10 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     h3_rng_seed(&audio_rng, params->seed);
     h3_rng_fill_normal(&video_rng, video, video_count);
     h3_rng_fill_normal(&audio_rng, audio, audio_count);
+    /* Prefetch is the default (bit-identical output); H3_VAE_PREFETCH=0
+     * loads the decoder after the denoise as released. */
     const char *prefetch_flag = getenv("H3_VAE_PREFETCH");
-    if (!preview_decoder && prefetch_flag &&
-        *prefetch_flag && strcmp(prefetch_flag, "0") &&
+    if (!preview_decoder && !(prefetch_flag && !strcmp(prefetch_flag, "0")) &&
         !(ctx->video_decoder && ctx->video_decoder_key &&
           !strcmp(ctx->video_decoder_key, decoder_key))) {
         prefetch.weight_directory = vae_path;

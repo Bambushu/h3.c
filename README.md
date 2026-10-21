@@ -52,7 +52,7 @@ Opt-in, unchanged unless enabled:
 
 | PR | Enable with | Notes |
 | --- | --- | --- |
-| [#73](https://github.com/antirez/h3.c/pull/73) | `H3_VAE_PRECISION=bf16`, `H3_VAE_PREFETCH=1`, `H3_VAE_CACHE=<dir>` | BF16 video VAE decode, decoder load overlapped with the denoise, cached lowered weights. Prefetch and cache are bit-identical; BF16 changes pixels slightly |
+| [#73](https://github.com/antirez/h3.c/pull/73) | **on by default here**: `H3_VAE_PRECISION=f32` and `H3_VAE_PREFETCH=0` restore the released path; `H3_VAE_CACHE=<dir>` is opt-in | BF16 video VAE decode (3 to 4x faster on an M5 Pro, 63 dB against F32 on the same latents), decoder load overlapped with the denoise, cached lowered weights. Prefetch and cache are bit-identical |
 | [#64](https://github.com/antirez/h3.c/pull/64) | `H3_SDPA_MAX_QUERY_ROWS=2048` or `--sdpa-query-block 2048` | Splits long non-causal SDPA queries to avoid MPSGraph corruption on M2/M3 Ultra. Off by default here (upstream PR defaults on) |
 | [#14](https://github.com/antirez/h3.c/pull/14) | `tools/fold_turbo_lora.py` | Offline tool and docs only: fold a step-distillation LoRA into a separate checkpoint for 5-6 step sampling |
 

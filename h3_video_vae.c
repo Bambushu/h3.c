@@ -226,13 +226,16 @@ static void cleanup(vae_context *vae) {
 }
 
 static int configured_precision(h3_gpu *gpu) {
+    /* bf16 is the default: 3 to 4x faster decode, 63 dB against F32 on the
+     * same latents (docs/bench-2026-10-21.md). H3_VAE_PRECISION=f32 restores
+     * the released arithmetic. */
     const char *value = getenv("H3_VAE_PRECISION");
-    if (!value || !*value || !strcmp(value, "f32")) return VAE_F32;
-    if (!strcmp(value, "bf16")) return VAE_BF16;
+    if (!value || !*value || !strcmp(value, "bf16")) return VAE_BF16;
+    if (!strcmp(value, "f32")) return VAE_F32;
     if (!strcmp(value, "int8"))
         return h3_gpu_has_int8_mlp(gpu) ? VAE_INT8 : VAE_BF16;
     fprintf(stderr, "h3: ignoring unknown H3_VAE_PRECISION=%s\n", value);
-    return VAE_F32;
+    return VAE_BF16;
 }
 
 /* Replace one resident F32 weight [rows, columns] by its BF16 copy or by
