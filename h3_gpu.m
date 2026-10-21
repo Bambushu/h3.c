@@ -5165,6 +5165,12 @@ int h3_gpu_sol_attention_bf16(
     uint64_t batch_stride = (uint64_t)sequence * heads * head_dim;
     uint64_t token_stride = (uint64_t)heads * head_dim;
     uint64_t head_stride = head_dim;
+    /* The int8 QKV projection writes Q/K/V head-major and says so through
+     * the same flag the dense path consumes; honour it and clear it. */
+    BOOL headMajorInputs = gpu.headMajorSDPAInputs;
+    gpu.headMajorSDPAInputs = NO;
+    uint64_t in_token_stride = headMajorInputs ? (uint64_t)head_dim : token_stride;
+    uint64_t in_head_stride = headMajorInputs ? (uint64_t)sequence * head_dim : head_stride;
     uint64_t output_token_stride = head_major_output ?
         head_dim : token_stride;
     uint64_t output_head_stride = head_major_output ?
@@ -5183,13 +5189,13 @@ int h3_gpu_sol_attention_bf16(
         [encoder setBytes:&heads length:sizeof(heads) atIndex:7];
         [encoder setBytes:&blocks length:sizeof(blocks) atIndex:8];
         [encoder setBytes:&batch_stride length:sizeof(batch_stride) atIndex:9];
-        [encoder setBytes:&token_stride length:sizeof(token_stride) atIndex:10];
-        [encoder setBytes:&head_stride length:sizeof(head_stride) atIndex:11];
+        [encoder setBytes:&in_token_stride length:sizeof(in_token_stride) atIndex:10];
+        [encoder setBytes:&in_head_stride length:sizeof(in_head_stride) atIndex:11];
         [encoder setBytes:&batch_stride length:sizeof(batch_stride) atIndex:12];
-        [encoder setBytes:&token_stride length:sizeof(token_stride) atIndex:13];
-        [encoder setBytes:&head_stride length:sizeof(head_stride) atIndex:14];
+        [encoder setBytes:&in_token_stride length:sizeof(in_token_stride) atIndex:13];
+        [encoder setBytes:&in_head_stride length:sizeof(in_head_stride) atIndex:14];
         [encoder setBytes:&batch_stride length:sizeof(batch_stride) atIndex:15];
-        [encoder setBytes:&token_stride length:sizeof(token_stride) atIndex:16];
+        [encoder setBytes:&in_token_stride length:sizeof(in_token_stride) atIndex:16];
         [encoder setBytes:&head_stride length:sizeof(head_stride) atIndex:17];
         [encoder dispatchThreadgroups:MTLSizeMake((size_t)heads * blocks, 1, 1)
                  threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
@@ -5236,14 +5242,14 @@ int h3_gpu_sol_attention_bf16(
         [encoder setBytes:&sink_start length:sizeof(sink_start) atIndex:14];
         [encoder setBytes:&sink_end length:sizeof(sink_end) atIndex:15];
         [encoder setBytes:&batch_stride length:sizeof(batch_stride) atIndex:16];
-        [encoder setBytes:&token_stride length:sizeof(token_stride) atIndex:17];
-        [encoder setBytes:&head_stride length:sizeof(head_stride) atIndex:18];
+        [encoder setBytes:&in_token_stride length:sizeof(in_token_stride) atIndex:17];
+        [encoder setBytes:&in_head_stride length:sizeof(in_head_stride) atIndex:18];
         [encoder setBytes:&batch_stride length:sizeof(batch_stride) atIndex:19];
-        [encoder setBytes:&token_stride length:sizeof(token_stride) atIndex:20];
-        [encoder setBytes:&head_stride length:sizeof(head_stride) atIndex:21];
+        [encoder setBytes:&in_token_stride length:sizeof(in_token_stride) atIndex:20];
+        [encoder setBytes:&in_head_stride length:sizeof(in_head_stride) atIndex:21];
         [encoder setBytes:&batch_stride length:sizeof(batch_stride) atIndex:22];
-        [encoder setBytes:&token_stride length:sizeof(token_stride) atIndex:23];
-        [encoder setBytes:&head_stride length:sizeof(head_stride) atIndex:24];
+        [encoder setBytes:&in_token_stride length:sizeof(in_token_stride) atIndex:23];
+        [encoder setBytes:&in_head_stride length:sizeof(in_head_stride) atIndex:24];
         [encoder setBytes:&batch_stride length:sizeof(batch_stride) atIndex:25];
         [encoder setBytes:&output_token_stride
                    length:sizeof(output_token_stride) atIndex:26];
