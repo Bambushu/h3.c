@@ -49,6 +49,17 @@ experiment. Nothing in the runners sets it.
 | `H3_PROFILE_SOL_ROUTES` | unset | `1` prints route density for blocks 0, 10, ... 49 on the first sparse step |
 | `H3_DUMP_SOL_ATTENTION=<prefix>`, `H3_DUMP_SOL_BLOCK`, `H3_DUMP_SOL_STEP` | unset | capture post-RoPE Q/K/V of one block and step for `h3_sol_attention_bench` |
 
+## Shared library (branch comfy-node)
+
+`make libh3.dylib` builds the engine as a shared library for foreign-function
+callers. It exports the h3.h surface plus `h3_flat_*` (h3_flat.h): params set
+by field name so a binding never mirrors the positional `h3_params`, ordered
+references, struct-free frame and progress callbacks, the CLI's flock, and
+`h3_flat_generate`, which chdirs into the engine directory for the call
+because the engine reads `h3_shaders.metal` from the working directory.
+ComfyUI-h3c loads it with ctypes. `h3_flat_tests` (in `make test`) checks
+every setter lands on its field.
+
 ## Diagnostics added
 
 `H3_DUMP_VIDEO_LATENT=<file>` writes the final video latent. `H3_PROFILE`
