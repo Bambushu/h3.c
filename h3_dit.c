@@ -2598,12 +2598,9 @@ static int capture_sol_attention(h3_dit *dit, unsigned block, int step,
 
 /* Sparse attention runs in the 20%-90% window of the schedule, the window
  * the published H3 SolAttn integration uses: the noisiest opening passes and
- * the final-detail pass stay dense. H3_SOL_ATTN_ALL_STEPS=1 removes the
- * window for diagnosis. */
+ * the final-detail pass stay dense. */
 static int use_sol_attention(const h3_dit *dit, int step) {
     if (!dit->sol_attention || dit->token_reduction_active) return 0;
-    const char *all_steps = getenv("H3_SOL_ATTN_ALL_STEPS");
-    if (all_steps && *all_steps && strcmp(all_steps, "0")) return 1;
     int steps = h3_dit_schedule_steps(dit->schedule);
     if (steps < 3 || step < 0 || step >= steps) return 0;
     /* H3_SOL_ATTN_DENSE_STEPS=N: the first N steps dense, every later step

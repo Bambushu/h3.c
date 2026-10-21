@@ -19,8 +19,7 @@ branch to build and use; features land on `feat/*` branches so they stay
 upstreamable. `docs/fork-census-2026-10-21.md` maps every fork, PR and
 derivative of h3.c with what each one measured, and is the basis for what is
 merged here and what comes next. `docs/bench-2026-10-21.md` measures upstream
-against this fork on an M5 Pro: the bf16 video VAE lane, Sol-Attn, and where
-the time goes.
+against this fork on an M5 Pro: the bf16 video VAE lane, resident int8, Sol-Attn, and where the time goes.
 
 ### Base: jerryfane's reviewed integration
 
@@ -112,7 +111,7 @@ with the flag unset.
 | `H3_SOL_ATTN` | unset | `1` enables the sparse path |
 | `H3_SOL_ATTN_TAU` | `-1` | Routing threshold; higher is sparser. yshenaw's ComfyUI runs used 1.3 |
 | `H3_SOL_ATTN_MIN_ROWS` | `4096` | Smallest sequence that routes sparsely |
-| `H3_SOL_ATTN_ALL_STEPS` | unset | `1` removes the dense opening/closing steps |
+| `H3_SOL_ATTN_DENSE_STEPS` | unset | `N` keeps the first N steps dense and every later step sparse (`0` = every step); unset keeps the 20%-90% window |
 | `H3_SOL_ATTN_STRICT` | unset | `1` makes a missing library or buffer an error instead of a dense fallback |
 | `H3_PROFILE_SOL_ROUTES` | unset | `1` prints the first sparse layer's route density once per generation |
 
@@ -129,12 +128,6 @@ source directory), #33 (default-on lock files, `/tmp` symlink hazard), #35 and
 #68 (interactive-only, #35 non-functional), #55 (SSD attention streaming for
 small-memory Macs; candidate for later), #14's header-alignment check (breaks
 valid files). Out of scope: #2, #43 (CUDA), #45 (GUI) and documentation-only PRs.
-
-Next: a port of the Sol sparse-attention Metal kernel
-(AlexanderIstomin/h3.c, isolated in fzeng656/h3.c) behind a flag, validated at
-a fixed seed against dense attention. Attention is the bulk of the denoise at
-production shapes and no dense kernel measured so far beats MPSGraph there; the
-census has the numbers.
 
 ## Tutorial
 

@@ -49,6 +49,7 @@ static void usage(const char *program) {
         "      --use-slower-uncached-int8-scales  Reread projection scales\n"
         "      --use-slower-dynamic-fc1-k  Use runtime-bound FC1 K loop\n"
         "      --use-slower-grouped-quantizer  Force 256-thread FC2 quantizer\n"
+        "      --sdpa-query-block N  Split non-causal SDPA queries into N-row blocks (off)\n"
         "      --seed N           Random seed (default: 42)\n"
         "      --first-frame PATH First-frame conditioning image\n"
         "      --last-frame PATH  Last-frame conditioning image\n"
