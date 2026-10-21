@@ -70,6 +70,16 @@ frames, `--steps 8 --layers 50 --reuse 1`) and standard (1344×768, 56 frames,
   float64 reference on 672 sampled row/head pairs per length with and without the
   #64 split, so the Ultra corruption was not reproduced on M5 Ultra.
 
+### Lanes on a 48 GB M5 Pro
+
+Resident int8 (no `--ssd-streaming`) is the lane: the DiT quantizes to int8
+once into `~/Library/Caches/h3c/dit` (18 GiB, on by default here; `H3_DIT_CACHE`
+moves it, `=0` disables it) and later loads map it in about 7 s. Measured on
+the reference shot (docs/bench-2026-10-21.md): denoise 468 s -> 297 s at
+544x960 and 1272 s -> 961 s at 768x1344 against the streamed BF16 path, DiT
+peak 20 to 23 GiB, free memory never under 32%. `--ssd-streaming` remains for
+machines where that does not fit.
+
 ### Added on top
 
 | Change | Source | Why |

@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 
 enum {
@@ -1941,10 +1942,29 @@ static h3_dit *new_dit(unsigned active_blocks, int ssd_streaming) {
     return dit;
 }
 
+/* The int8 DiT cache is on by default under ~/Library/Caches/h3c/dit (18 GiB
+ * per checkpoint): a cold load quantizes for about 100 s on an M5 Pro, a cached
+ * one maps in 7 s. H3_DIT_CACHE=<dir> moves it, H3_DIT_CACHE=0 disables it. */
+static const char *default_cache_directory(char *buffer, size_t size) {
+    const char *home = getenv("HOME");
+    if (!home || !*home) return NULL;
+    int length = snprintf(buffer, size, "%s/Library/Caches/h3c", home);
+    if (length <= 0 || (size_t)length >= size) return NULL;
+    (void)mkdir(buffer, 0700);
+    length = snprintf(buffer, size, "%s/Library/Caches/h3c/dit", home);
+    if (length <= 0 || (size_t)length >= size) return NULL;
+    return buffer;
+}
+
 static void open_cache(h3_dit *dit, const char *weight_directory,
                        const char *shader_source_path) {
+    char default_directory[1024];
     const char *directory = getenv("H3_DIT_CACHE");
-    if (!directory || !*directory) return;
+    if (directory && !strcmp(directory, "0")) return;
+    if (!directory || !*directory)
+        directory = default_cache_directory(default_directory,
+                                            sizeof(default_directory));
+    if (!directory) return;
     char description[512];
     h3_dit_cache *cache = calloc(1, sizeof(*cache));
     if (!cache ||
