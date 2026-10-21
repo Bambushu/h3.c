@@ -88,7 +88,34 @@ machines where that does not fit.
 | `--shift F` and `!shift` | after [neysay/h3.c](https://github.com/neysay/h3.c) debd9a1 | The video sigma shift (released: 12) as a parameter, for adapters trained at another shift. The prepared-transformer key carries scheduler and shift |
 | `--first-frame` center-crops to the render aspect | [JunzoKamahara/h3.c](https://github.com/JunzoKamahara/h3.c) b17de03 | It stretched while `--last-frame` cropped; plates whose aspect differed from the canvas were squashed |
 | H.264 `-preset slow` | [#70](https://github.com/antirez/h3.c/issues/70) | The fast preset added its own blocking on top of the decoded frames. CRF stays 18 |
+| `--motion-context` / `--save-context`: chain clips on the previous take's latent tail | after [ComfyUI-H3-Motion-Context](https://github.com/NikoDemon80/ComfyUI-H3-Motion-Context) | A reference video of the previous clip restages the shot (measured: a jump cut, and twice the rows). Pinning the last 22 frames and 0.9 s of sound at the head of the next generation continues it; see below |
 | Sol-Attn block-sparse attention, opt-in | [AlexanderIstomin/h3.c](https://github.com/AlexanderIstomin/h3.c) `perf/h3-sol-attn-metal`, compiler fixes from [fzeng656/h3.c](https://github.com/fzeng656/h3.c); kernel by [yshenaw](https://github.com/yshenaw/ComfyUI-SolAttn-MPS) | Attention is the bulk of the denoise at production shapes and no dense kernel beats MPSGraph there. See below |
+
+### Motion context: continuing a take
+
+```sh
+./h3 -d ./MiniMax-H3 -p "$(cat beat1.txt)" --seconds 5 --seed 11 \
+  --save-context beat1.h3ctx -o beat1.mp4
+./h3 -d ./MiniMax-H3 -p "$(cat beat2.txt)" --seconds 5 --seed 12 \
+  --motion-context beat1.h3ctx -o beat2.mp4
+```
+
+`--save-context` writes the take's final video and audio latents. A later
+`--motion-context` slices that file's last 22 frames (7 latent steps on the
+1,4,4,4,4 grid) and pins them as visual condition rows on the new take's own
+first step times, with its last 0.917 s of sound pinned as audio condition
+rows that end at the join, so the model continues the motion and the sound
+rather than restaging them. The pinned head is then trimmed from the
+delivered clip: a `--seconds 5` continuation delivers 22 frames (0.917 s)
+less than requested, and the clips concatenate. `--motion-context` also
+accepts a finished video; its tail is then decoded and re-encoded with the
+released VAEs (a lossy round trip, and the audio window is placed as if the
+clip's sound had been cut at its last frame). Both clips must share the
+canvas. Motion context cannot be combined with `--first-frame` or with
+Ref2VA references; `--last-frame` still works. Keep links at 8 to 10
+seconds: in ComfyUI the same 22-frame pin held a 10 s join and lost a 15 s
+one. `--profile` prints the pinned run, the audio window and the delivered
+length.
 
 ### Sol-Attn (experimental, not recommended on this machine)
 

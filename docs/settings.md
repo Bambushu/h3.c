@@ -23,6 +23,7 @@ default: `docs/bench-2026-10-21.md`.
 | Sampler | `--sampler euler` (default) or `res` | euler only | flag, or `!sampler` interactively |
 | Scheduler | `--scheduler linear` (default), `simple`, `beta`, `beta57` | linear only | flag |
 | Video sigma shift | `--shift 12` (default; audio stays 3) | fixed 12 | flag, `!shift` interactively |
+| Motion context | off | not in upstream | `--motion-context PREV` (a `--save-context` file or a video) pins PREV's last 22 frames and 0.917 s of sound at the head of the take and trims them from the output; `--save-context PATH` writes the take's final latents |
 | SDPA query split (PR #64) | off (no accuracy cliff measured on the M5 Pro) | not in upstream; the PR defaults it on | `--sdpa-query-block 2048` or `H3_SDPA_MAX_QUERY_ROWS=2048`; `H3_SDPA_SPLIT_MIN_ROWS` (12288) |
 | GPU queue depth | upstream default | | `H3_GPU_QUEUE_DEPTH=<n>` |
 | Early DiT load | off | not in upstream | `H3_DIT_EARLY_LOAD=1` (DiT coexists with the encoders; needs the memory) |
@@ -78,6 +79,12 @@ Measured on the reference shot (124 frames, 8 steps):
 | 768x1344 | 7 s | 961 to 1015 s | 86 s | about 18.5 min | 23 GiB |
 
 Upstream on the same shot: 12 min and 27.7 min.
+
+## Chaining takes
+
+`--save-context` on every take that may be continued, `--motion-context` on
+the continuation. The continuation delivers 22 frames less than requested.
+Verification numbers: `docs/bench-2026-10-21.md`.
 
 ## Not merged, not planned unless asked
 
