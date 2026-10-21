@@ -30,6 +30,19 @@ h3_mutex_tests: tests/test_h3_mutex.o h3_mutex.o
 libh3.a: $(LIB_OBJ)
 	$(AR) rcs $@ $^
 
+# Shared library for foreign-function callers (ComfyUI-h3c). h3_flat.c is a
+# struct-free setter API over h3.h; the CLI's process flock is exported too.
+# The engine reads h3_shaders.metal from the working directory, which
+# h3_flat_generate sets for the duration of a call.
+libh3.dylib: $(LIB_OBJ) h3_flat.o h3_mutex.o libh3.exports
+	$(CC) -dynamiclib -install_name @rpath/libh3.dylib \
+		-compatibility_version 0.1 -current_version 0.1 \
+		-exported_symbols_list libh3.exports \
+		-o $@ $(filter %.o,$^) $(LDLIBS)
+
+h3_flat_tests: tests/test_h3_flat.o h3_mutex.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
 # Diagnostic: replay a video VAE decode from H3_DUMP_VIDEO_LATENT output.
 vae_bench: tools/vae_bench.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
@@ -114,13 +127,14 @@ h3_real_video_vae_test: tests/test_real_video_vae.o $(LIB_OBJ)
 h3_semantic_vae_test: tests/test_semantic_vae.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
-test: h3_mutex_tests h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests h3_text_tests \
+test: h3_mutex_tests h3_flat_tests h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests h3_text_tests \
 	h3_audio_gpu_tests h3_real_audio_vae_test h3_real_audio_encoder_test \
 	h3_av_mux_test \
 	h3_real_video_encoder_test h3_real_qwen_vision_test \
 	h3_real_multimodal_text_test h3_real_ref_video_text_test
 
 	./h3_mutex_tests
+	./h3_flat_tests
 	./h3_tests
 	@if test -f misc/fixtures/h3_dit.safetensors && \
 	         test -f misc/fixtures/h3_dit_bf16.safetensors; then \
@@ -221,7 +235,7 @@ linenoise.o: CFLAGS += -Wno-conversion -Wno-variadic-macro-arguments-omitted
 -include $(wildcard *.d tests/*.d)
 
 clean:
-	rm -f h3 h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests \
+	rm -f h3 h3_flat_tests h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests \
 		h3_text_tests h3_real_prompt_test h3_real_dit_block_test \
 		h3_audio_gpu_tests h3_real_audio_vae_test h3_real_audio_encoder_test \
 		h3_av_mux_test \
@@ -230,7 +244,7 @@ clean:
 		h3_real_dit_schedule_test h3_real_dit_test h3_semantic_dit_test \
 		h3_real_video_vae_test h3_semantic_vae_test \
 	h3_dit_bench h3_dit_bench_864 vae_bench h3_vae_encoder_bench \
-	libh3.a *.o *.d tests/*.o tests/*.d tools/*.o tools/*.d
+	libh3.a libh3.dylib *.o *.d tests/*.o tests/*.d tools/*.o tools/*.d
 
 mc_probe: tools/mc_probe.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)

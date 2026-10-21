@@ -1,0 +1,11 @@
+_h3_load_dir
+_h3_free
+_h3_last_error
+_h3_device
+_h3_model
+_h3_cache_set_enabled
+_h3_cache_clear
+_h3_cache_get_info
+_h3_generate
+_h3_result_free
+_h3_flat_*
