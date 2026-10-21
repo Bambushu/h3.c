@@ -438,6 +438,16 @@ static h3_position *h3_video_grid(double cursor, int latent_t,
     return grid;
 }
 
+/* The timeline span a reference block occupies before the target origin. */
+static double h3_reference_span(const h3_layout_ref *reference) {
+    if (reference->kind == H3_LAYOUT_REF_IMAGE) return 1.0;
+    if (reference->kind == H3_LAYOUT_REF_AUDIO) return (double)reference->audio_t;
+    if (reference->kind == H3_LAYOUT_REF_VIDEO)
+        return fmax((double)reference->audio_t,
+                    h3_video_span_sum(reference->latent_t));
+    return 0.0;
+}
+
 int h3_layout_build(const h3_layout_spec *spec, h3_layout *layout,
                     char *error, size_t error_size) {
     if (!spec || !layout) return 0;
@@ -447,9 +457,6 @@ int h3_layout_build(const h3_layout_spec *spec, h3_layout *layout,
     if (spec->text_len < 1 || spec->latent_t < 1 || spec->audio_t < 0 ||
         spec->frame_count < 5) {
         return h3_builder_fail(&builder, "invalid target layout dimensions");
-    }
-    if ((spec->keyframe_count || spec->head_steps) && spec->reference_count) {
-        return h3_builder_fail(&builder, "keyframes and references are mutually exclusive");
     }
     if (spec->head_steps < 0 || spec->head_steps >= spec->latent_t ||
         spec->head_audio_t < 0 || (spec->head_audio_t && !spec->head_steps)) {
@@ -476,14 +483,21 @@ int h3_layout_build(const h3_layout_spec *spec, h3_layout *layout,
     }
     free(text);
 
+    /* References pack between the text and the targets, so the target
+     * timeline starts after their spans; the pinned head and the keyframes
+     * are timed from that origin, where the target rows they stand in for
+     * sit, whatever their place in the sequence. */
     double cursor = (double)spec->text_len;
+    double origin = cursor;
+    for (size_t index = 0; index < spec->reference_count; index++)
+        origin += h3_reference_span(&spec->references[index]);
     if (spec->head_steps) {
         /* Motion context: the previous clip's last head_steps latent steps
          * stand in for the target's own first steps, so they take exactly
          * those rows' (t, h, w), and its audio tail runs on the target audio
          * grid from head_audio_offset so that it ends at the join. */
         size_t rows = 0;
-        h3_position *head = h3_video_grid(cursor, spec->head_steps, frame,
+        h3_position *head = h3_video_grid(origin, spec->head_steps, frame,
                                           frame_rows, &rows);
         if (!head) goto oom;
         int ok = h3_emit(&builder, H3_SEG_COND, head, rows);
@@ -493,7 +507,7 @@ int h3_layout_build(const h3_layout_spec *spec, h3_layout *layout,
         if (spec->head_audio_t) {
             size_t audio_rows = 0;
             h3_position *audio = h3_audio_grid(
-                cursor + spec->head_audio_offset, spec->head_audio_t,
+                origin + spec->head_audio_offset, spec->head_audio_t,
                 w_axis[0], w_axis[w_count - 1], &audio_rows);
             if (!audio) goto oom;
             ok = h3_emit(&builder, H3_SEG_REF_AUDIO, audio, audio_rows);
@@ -509,9 +523,9 @@ int h3_layout_build(const h3_layout_spec *spec, h3_layout *layout,
                 h3_builder_fail(&builder, "motion context replaces the first-frame keyframe");
                 goto fail;
             }
-            condition_time = (double)spec->text_len;
+            condition_time = origin;
         } else if (spec->keyframes[index] == spec->frame_count - 1) {
-            condition_time = (double)spec->text_len +
+            condition_time = origin +
                              h3_video_span_sum(spec->latent_t) - h3_frame_rescale;
         } else {
             h3_builder_fail(&builder, "only first and last keyframes are valid");
@@ -537,7 +551,7 @@ int h3_layout_build(const h3_layout_spec *spec, h3_layout *layout,
             free(ref_w);
             if (!ok) goto fail;
             layout->img_cond_rows += ref_rows;
-            cursor += 1.0;
+            cursor += h3_reference_span(reference);
         } else if (reference->kind == H3_LAYOUT_REF_AUDIO) {
             size_t rows = 0;
             h3_position *audio = h3_audio_grid(cursor, reference->audio_t,
@@ -548,7 +562,7 @@ int h3_layout_build(const h3_layout_spec *spec, h3_layout *layout,
             free(audio);
             if (!ok) goto fail;
             layout->audio_cond_rows += rows;
-            cursor += reference->audio_t;
+            cursor += h3_reference_span(reference);
         } else if (reference->kind == H3_LAYOUT_REF_VIDEO) {
             h3_position *ref_frame = NULL;
             double *ref_w = NULL;
@@ -585,8 +599,7 @@ int h3_layout_build(const h3_layout_spec *spec, h3_layout *layout,
             free(video);
             if (!ok) goto fail;
             layout->img_cond_rows += video_rows;
-            double video_span = h3_video_span_sum(reference->latent_t);
-            cursor += fmax((double)reference->audio_t, video_span);
+            cursor += h3_reference_span(reference);
         } else {
             h3_builder_fail(&builder, "unknown reference layout type");
             goto fail;

@@ -161,8 +161,8 @@ typedef struct {
     /* Motion context: continue a previous generation. Its last 22 frames and
      * 0.917 s of sound are pinned at the head of this one and trimmed from
      * the delivered output. Either the file a run wrote with save_context
-     * (final latents, bit-exact) or a finished video. Not combinable with
-     * first_frame or references. */
+     * (final latents, bit-exact) or a finished video. It replaces
+     * first_frame; last_frame and ordered references ride along. */
     const char *motion_context;
     /* Write this generation's final latents for a later motion_context. */
     const char *save_context;

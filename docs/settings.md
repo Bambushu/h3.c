@@ -23,7 +23,7 @@ default: `docs/bench-2026-10-21.md`.
 | Sampler | `--sampler euler` (default) or `res` | euler only | flag, or `!sampler` interactively |
 | Scheduler | `--scheduler linear` (default), `simple`, `beta`, `beta57` | linear only | flag |
 | Video sigma shift | `--shift 12` (default; audio stays 3) | fixed 12 | flag, `!shift` interactively |
-| Motion context | off | not in upstream | `--motion-context PREV.h3ctx` (or `PREV.mp4`) pins PREV's last 22 frames and 0.917 s of sound at the head of the take and trims them from the output (join r 0.99 measured from the context file and from the MP4); `--save-context PATH` writes the take's final latents. The MP4 route re-encodes the tail with the VAEs (about 100 s at 544x960) and refuses clips over 45 s |
+| Motion context | off | not in upstream | `--motion-context PREV.h3ctx` (or `PREV.mp4`) pins PREV's last 22 frames and 0.917 s of sound at the head of the take and trims them from the output (join r 0.99 measured from the context file and from the MP4); `--save-context PATH` writes the take's final latents. The MP4 route re-encodes the tail with the VAEs (about 100 s at 544x960) and refuses clips over 45 s. Combines with `--ref-image` and the other ordered references and with `--last-frame` (2026-10-21); it replaces `--first-frame` |
 | SDPA query split (PR #64) | off (no accuracy cliff measured on the M5 Pro) | not in upstream; the PR defaults it on | `--sdpa-query-block 2048` or `H3_SDPA_MAX_QUERY_ROWS=2048`; `H3_SDPA_SPLIT_MIN_ROWS` (12288) |
 | GPU queue depth | upstream default | | `H3_GPU_QUEUE_DEPTH=<n>` |
 | Early DiT load | off | not in upstream | `H3_DIT_EARLY_LOAD=1` (DiT coexists with the encoders; needs the memory) |
@@ -83,7 +83,7 @@ Upstream on the same shot: 12 min and 27.7 min.
 ## Chaining takes
 
 `--save-context` on every take that may be continued, `--motion-context` on
-the continuation; a take rendered without a context file chains from its
+the continuation, with the same `--ref-image` on both; a take rendered without a context file chains from its
 MP4 (the sound window is the clip's own grid tail; the stream's tail sits
 most of a step late and cuts). The continuation delivers 22 frames less than
 requested. Verification numbers: `docs/bench-2026-10-21.md`.
@@ -91,8 +91,10 @@ requested. Verification numbers: `docs/bench-2026-10-21.md`.
 ## Not merged, not planned unless asked
 
 ldoroshe's graft-format checkpoint loader (conflicts with the AdaLN cache),
-LachlanStuart's hybrid anchors, PR #55 SSD attention streaming, neokree's
-query-blocking default, runtime LoRA loading, Morton ordering for Sol.
+PR #55 SSD attention streaming, neokree's query-blocking default, runtime
+LoRA loading, Morton ordering for Sol. (LachlanStuart's hybrid anchors went
+in on 2026-10-21 in this build's own form: anchors and the motion context
+head timed from the target origin, as ComfyUI does, not from the text.)
 
 ## Bench harness
 

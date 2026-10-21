@@ -88,7 +88,7 @@ machines where that does not fit.
 | `--shift F` and `!shift` | after [neysay/h3.c](https://github.com/neysay/h3.c) debd9a1 | The video sigma shift (released: 12) as a parameter, for adapters trained at another shift. The prepared-transformer key carries scheduler and shift |
 | `--first-frame` center-crops to the render aspect | [JunzoKamahara/h3.c](https://github.com/JunzoKamahara/h3.c) b17de03 | It stretched while `--last-frame` cropped; plates whose aspect differed from the canvas were squashed |
 | H.264 `-preset slow` | [#70](https://github.com/antirez/h3.c/issues/70) | The fast preset added its own blocking on top of the decoded frames. CRF stays 18 |
-| `--motion-context` / `--save-context`: chain clips on the previous take's latent tail | after [ComfyUI-H3-Motion-Context](https://github.com/NikoDemon80/ComfyUI-H3-Motion-Context) | A reference video of the previous clip restages the shot (measured: a jump cut, and twice the rows). Pinning the last 22 frames and 0.9 s of sound at the head of the next generation continues it; see below |
+| `--motion-context` / `--save-context`: chain clips on the previous take's latent tail | after [ComfyUI-H3-Motion-Context](https://github.com/NikoDemon80/ComfyUI-H3-Motion-Context) | A reference video of the previous clip restages the shot (measured: a jump cut, and twice the rows). Pinning the last 22 frames and 0.9 s of sound at the head of the next generation continues it, with the same `--ref-image` identity references alongside; see below |
 | Sol-Attn block-sparse attention, opt-in | [AlexanderIstomin/h3.c](https://github.com/AlexanderIstomin/h3.c) `perf/h3-sol-attn-metal`, compiler fixes from [fzeng656/h3.c](https://github.com/fzeng656/h3.c); kernel by [yshenaw](https://github.com/yshenaw/ComfyUI-SolAttn-MPS) | Attention is the bulk of the denoise at production shapes and no dense kernel beats MPSGraph there. See below |
 
 ### Motion context: continuing a take
@@ -118,9 +118,14 @@ track places most of a latent step late, and that cut: r 0.82). The video
 route costs about 100 s of VAE encode at 544x960 before the denoise and
 pins rows at cosine 0.97 to the true latents rather than the file's exact
 ones; a clip over 45 s needs its context file. Both clips must share the
-canvas. Motion context cannot be combined with `--first-frame` or with
-Ref2VA references; `--last-frame` still works. Keep links at 8 to 10
-seconds: in ComfyUI the same 22-frame pin held a 10 s join and lost a 15 s
+canvas. Motion context replaces `--first-frame`; `--last-frame` and the
+ordered references (`--ref-image`, `--ref-video`, `--ref-audio`) ride
+along, so a continuation keeps the identity references of the take it
+continues. The head and the anchors lead the packed sequence and are timed
+from the target origin, after the reference spans, as ComfyUI lays them
+out; their rows and the reference rows share the condition buffers in that
+order. Keep links at 8 to 10 seconds: in ComfyUI the same 22-frame pin
+held a 10 s join and lost a 15 s
 one. The head adds its rows to every attention step: 32% more denoise on the
 124-frame bench shot. `--profile` prints the pinned run, the audio window and
 the delivered length. Numbers: `docs/bench-2026-10-21.md`.
@@ -518,7 +523,10 @@ For example:
 
 ### 8. Add image, video, and audio references
 
-First/last-frame anchors select the FL2VA path:
+First/last-frame anchors select the FL2VA path (with ordered references they
+ride along on the Ref2VA path instead, timed from the target origin; only
+the FL2VA weights presented as Ref2VA have been run that way, see the motion
+context section):
 
 ```sh
 ./h3 -d ./MiniMax-H3 -p "The fox keeps walking through the snow." \

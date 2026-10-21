@@ -478,6 +478,107 @@ static void test_layout_ref2va(void) {
     h3_layout_free(&layout);
 }
 
+static void test_layout_motion_context_refs(void) {
+    /* The pinned head and its audio window sit on the target timeline, which
+     * starts after the reference spans (1 + 48 + 80 steps here), while the
+     * references themselves keep their slots right after the text. */
+    h3_layout_ref references[] = {
+        {H3_LAYOUT_REF_IMAGE, 0, 16, 24, 0},
+        {H3_LAYOUT_REF_VIDEO, 7, 16, 24, 48},
+        {H3_LAYOUT_REF_AUDIO, 0, 0, 0, 80}
+    };
+    h3_layout_spec spec = {192, 17, 30, 54, 93, 56,
+                           NULL, 0, references, 3, 7, 37, 0.0};
+    h3_layout layout;
+    char error[256];
+    CHECK(h3_layout_build(&spec, &layout, error, sizeof(error)));
+    CHECK(layout.seq_len == 11196);
+    const size_t bounds[][2] = {
+        {0, 192}, {192, 3027}, {3027, 3101}, {3101, 3197}, {3197, 3293},
+        {3293, 3965}, {3965, 4125}, {4125, 4311}, {4311, 11196}
+    };
+    const h3_segment_kind kinds[] = {
+        H3_SEG_TEXT, H3_SEG_COND, H3_SEG_REF_AUDIO, H3_SEG_REF_IMAGE,
+        H3_SEG_REF_AUDIO, H3_SEG_REF_IMAGE, H3_SEG_REF_AUDIO, H3_SEG_AUDIO,
+        H3_SEG_VIDEO
+    };
+    check_segments(&layout, bounds, kinds, 9);
+    CHECK(layout.img_cond_rows == 2835 + 768);
+    CHECK(layout.audio_cond_rows == 74 + 256);
+    CHECK(layout.img_target_rows == 6885 && layout.audio_target_rows == 186);
+    CHECK(layout.positions[192].t == 321.0);
+    CHECK(layout.positions[3101].t == 192.0);
+    CHECK(layout.positions[4125].t == 321.0);
+    int same = 1;
+    for (size_t row = 0; row < 2835; row++) {
+        const h3_position *pinned = &layout.positions[192 + row];
+        const h3_position *target = &layout.positions[4311 + row];
+        if (pinned->t != target->t || pinned->h != target->h ||
+            pinned->w != target->w) same = 0;
+    }
+    CHECK(same);
+    same = 1;
+    for (size_t step = 0; step < 37; step++) {
+        for (int stereo = 0; stereo < 2; stereo++) {
+            const h3_position *pinned =
+                &layout.positions[3027 + (size_t)stereo * 37 + step];
+            const h3_position *target =
+                &layout.positions[4125 + (size_t)stereo * 93 + step];
+            if (pinned->t != target->t || pinned->w != target->w) same = 0;
+        }
+    }
+    CHECK(same);
+    h3_layout_free(&layout);
+}
+
+static void test_layout_hybrid(void) {
+    /* Frame anchors with references: the anchors lead the sequence as in
+     * the FL2VA layout but are timed from the target origin, after the
+     * reference spans, where the target rows they stand in for sit. */
+    int keyframes[] = {0, 55};
+    h3_layout_ref references[] = {
+        {H3_LAYOUT_REF_IMAGE, 0, 16, 24, 0},
+        {H3_LAYOUT_REF_VIDEO, 7, 16, 24, 48},
+        {H3_LAYOUT_REF_AUDIO, 0, 0, 0, 80}
+    };
+    h3_layout_spec spec = {192, 17, 30, 54, 93, 56,
+                           keyframes, 2, references, 3, 0, 0, 0.0};
+    h3_layout layout;
+    char error[256];
+    CHECK(h3_layout_build(&spec, &layout, error, sizeof(error)));
+    CHECK(layout.seq_len == 9097);
+    const size_t bounds[][2] = {
+        {0, 192}, {192, 597}, {597, 1002}, {1002, 1098}, {1098, 1194},
+        {1194, 1866}, {1866, 2026}, {2026, 2212}, {2212, 9097}
+    };
+    const h3_segment_kind kinds[] = {
+        H3_SEG_TEXT, H3_SEG_COND, H3_SEG_COND, H3_SEG_REF_IMAGE,
+        H3_SEG_REF_AUDIO, H3_SEG_REF_IMAGE, H3_SEG_REF_AUDIO, H3_SEG_AUDIO,
+        H3_SEG_VIDEO
+    };
+    check_segments(&layout, bounds, kinds, 9);
+    CHECK(layout.img_cond_rows == 810 + 768);
+    CHECK(layout.audio_cond_rows == 256);
+    CHECK(layout.positions[192].t == layout.positions[2212].t);
+    CHECK(layout.positions[192].t == 321.0);
+    CHECK(close_enough(layout.positions[597].t, 321.0 + 55.0 * 5.0 / 3.0, 1e-9));
+    CHECK(layout.positions[1002].t == 192.0);
+    h3_layout_free(&layout);
+    /* A pinned head still replaces the first-frame anchor. */
+    spec.head_steps = 7;
+    spec.head_audio_t = 37;
+    CHECK(!h3_layout_build(&spec, &layout, error, sizeof(error)));
+    spec.keyframes = &keyframes[1];
+    spec.keyframe_count = 1;
+    CHECK(h3_layout_build(&spec, &layout, error, sizeof(error)));
+    CHECK(layout.img_cond_rows == 2835 + 405 + 768);
+    CHECK(layout.segments[1].kind == H3_SEG_COND &&
+          layout.segments[2].kind == H3_SEG_REF_AUDIO &&
+          layout.segments[3].kind == H3_SEG_COND &&
+          layout.segments[4].kind == H3_SEG_REF_IMAGE);
+    h3_layout_free(&layout);
+}
+
 static void write_all(int descriptor, const void *data, size_t size) {
     const unsigned char *bytes = data;
     while (size) {
@@ -1128,6 +1229,8 @@ int main(void) {
     test_layout_motion_context();
     test_motion_context_file();
     test_layout_ref2va();
+    test_layout_motion_context_refs();
+    test_layout_hybrid();
     test_safetensors();
     test_dit_cache();
     test_rng_and_solver();
