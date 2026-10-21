@@ -158,13 +158,21 @@ typedef struct {
     /* Video sigma shift for the sampler grid. Zero selects the released
      * H3_VIDEO_SIGMA_SHIFT (12); the audio shift is fixed at 3. */
     double video_shift;
+    /* Motion context: continue a previous generation. Its last 22 frames and
+     * 0.917 s of sound are pinned at the head of this one and trimmed from
+     * the delivered output. Either the file a run wrote with save_context
+     * (final latents, bit-exact) or a finished video. Not combinable with
+     * first_frame or references. */
+    const char *motion_context;
+    /* Write this generation's final latents for a later motion_context. */
+    const char *save_context;
 } h3_params;
 
 #define H3_PARAMS_DEFAULT { \
     H3_DEFAULT_WIDTH, H3_DEFAULT_HEIGHT, H3_DEFAULT_FRAMES, H3_DEFAULT_STEPS, \
     UINT64_C(42), NULL, NULL, NULL, NULL, 0, H3_REFERENCE_IMAGE_MATCH, \
     1, H3_DEFAULT_DIT_LAYERS, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NULL, NULL, NULL, \
-    H3_SAMPLER_EULER, H3_SCHEDULER_LINEAR, 0.0 \
+    H3_SAMPLER_EULER, H3_SCHEDULER_LINEAR, 0.0, NULL, NULL \
 }
 
 typedef struct {

@@ -29,6 +29,12 @@ int h3_video_encoder_latent_t(int frame_count) {
     return frame_count > 0 ? (frame_count + 3) / 4 : 0;
 }
 
+int h3_video_head_steps(int frame_count) {
+    int covered = 0, steps = 0;
+    while (covered < frame_count) covered += h3_frame_per_token[steps++ % 5];
+    return frame_count > 0 && covered == frame_count ? steps : 0;
+}
+
 h3_temporal_shape h3_temporal(int requested_frames) {
     h3_temporal_shape result;
     result.frame_count = h3_align_frame_count(requested_frames);
@@ -442,8 +448,12 @@ int h3_layout_build(const h3_layout_spec *spec, h3_layout *layout,
         spec->frame_count < 5) {
         return h3_builder_fail(&builder, "invalid target layout dimensions");
     }
-    if (spec->keyframe_count && spec->reference_count) {
+    if ((spec->keyframe_count || spec->head_steps) && spec->reference_count) {
         return h3_builder_fail(&builder, "keyframes and references are mutually exclusive");
+    }
+    if (spec->head_steps < 0 || spec->head_steps >= spec->latent_t ||
+        spec->head_audio_t < 0 || (spec->head_audio_t && !spec->head_steps)) {
+        return h3_builder_fail(&builder, "motion context head must be shorter than the target");
     }
 
     h3_position *frame = NULL;
@@ -467,9 +477,38 @@ int h3_layout_build(const h3_layout_spec *spec, h3_layout *layout,
     free(text);
 
     double cursor = (double)spec->text_len;
+    if (spec->head_steps) {
+        /* Motion context: the previous clip's last head_steps latent steps
+         * stand in for the target's own first steps, so they take exactly
+         * those rows' (t, h, w), and its audio tail runs on the target audio
+         * grid from head_audio_offset so that it ends at the join. */
+        size_t rows = 0;
+        h3_position *head = h3_video_grid(cursor, spec->head_steps, frame,
+                                          frame_rows, &rows);
+        if (!head) goto oom;
+        int ok = h3_emit(&builder, H3_SEG_COND, head, rows);
+        free(head);
+        if (!ok) goto fail;
+        layout->img_cond_rows += rows;
+        if (spec->head_audio_t) {
+            size_t audio_rows = 0;
+            h3_position *audio = h3_audio_grid(
+                cursor + spec->head_audio_offset, spec->head_audio_t,
+                w_axis[0], w_axis[w_count - 1], &audio_rows);
+            if (!audio) goto oom;
+            ok = h3_emit(&builder, H3_SEG_REF_AUDIO, audio, audio_rows);
+            free(audio);
+            if (!ok) goto fail;
+            layout->audio_cond_rows += audio_rows;
+        }
+    }
     for (size_t index = 0; index < spec->keyframe_count; index++) {
         double condition_time;
         if (spec->keyframes[index] == 0) {
+            if (spec->head_steps) {
+                h3_builder_fail(&builder, "motion context replaces the first-frame keyframe");
+                goto fail;
+            }
             condition_time = (double)spec->text_len;
         } else if (spec->keyframes[index] == spec->frame_count - 1) {
             condition_time = (double)spec->text_len +

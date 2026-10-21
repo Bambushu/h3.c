@@ -1,6 +1,7 @@
 #include "h3_internal.h"
 #include "h3_audio_vae.h"
 #include "h3_host.h"
+#include "h3_motion_context.h"
 #include "h3_dit.h"
 #include "h3_ffmpeg.h"
 #include "h3_metal.h"
@@ -144,10 +145,12 @@ static char *h3_conditioning_key(const char *prompt, const h3_params *params,
     h3_key key = {0};
     if (!h3_key_append(&key, "mode=%d|prompt=%zu:%s", ref2va,
                        strlen(prompt), prompt)) goto failed;
-    if (!ref2va && !params->first_frame && !params->last_frame) return key.text;
+    if (!ref2va && !params->first_frame && !params->last_frame &&
+        !params->motion_context) return key.text;
     if (!h3_key_append(&key, "|render=%dx%d|frames=%d|image-size=%d",
                        render_width, render_height, params->frames,
                        params->reference_image_size) ||
+        !h3_key_file(&key, "context", params->motion_context) ||
         !h3_key_file(&key, "first", params->first_frame) ||
         !h3_key_file(&key, "last", params->last_frame)) goto failed;
     for (size_t index = 0; index < params->reference_count; index++) {
@@ -328,24 +331,36 @@ static void h3_augment_span(float *values, size_t count, uint64_t seed) {
 static int h3_augment_conditions(const h3_params *params, int ref2va,
                                  int render_width, int render_height,
                                  const h3_layout_ref *references,
+                                 const h3_motion_context *motion,
                                  float *video, size_t video_elements,
                                  float *audio, size_t audio_elements) {
     size_t video_offset = 0;
     size_t audio_offset = 0;
     if (!ref2va) {
+        if (motion) {
+            /* The pinned head: one seeded span for its visual rows, one for
+             * its audio rows, as a reference video would get. */
+            if (motion->video_elements > video_elements ||
+                motion->audio_elements != audio_elements) return 0;
+            h3_augment_span(video, motion->video_elements, params->seed);
+            video_offset = motion->video_elements;
+            h3_augment_span(audio, audio_elements, params->seed + 1);
+            audio_offset = audio_elements;
+        }
         int latent_w, latent_h;
         h3_latent_canvas(render_width, render_height, &latent_w, &latent_h);
         size_t span = (size_t)h3_video_encoder_latent_t(1) *
                       (size_t)latent_h * (size_t)latent_w / 4 * 96;
         size_t count = (size_t)(params->first_frame != NULL) +
                        (size_t)(params->last_frame != NULL);
-        if (count && (span > SIZE_MAX / count || span * count != video_elements))
+        if (count && (span > SIZE_MAX / count ||
+                      span * count != video_elements - video_offset))
             return 0;
         for (size_t index = 0; index < count; index++) {
             h3_augment_span(video + video_offset, span, params->seed);
             video_offset += span;
         }
-        return video_offset == video_elements && audio_elements == 0;
+        return video_offset == video_elements && audio_offset == audio_elements;
     }
     for (size_t index = 0; index < params->reference_count; index++) {
         const h3_layout_ref *reference = &references[index];
@@ -625,6 +640,10 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
         h3_set_error(ctx, "full references cannot be combined with frame anchors");
         return 0;
     }
+    if (params->motion_context && (params->reference_count || params->first_frame)) {
+        h3_set_error(ctx, "motion context cannot be combined with full references or a first frame");
+        return 0;
+    }
     size_t images = 0, videos = 0, audio_inputs = 0;
     for (size_t index = 0; index < params->reference_count; index++) {
         const h3_reference *reference = &params->references[index];
@@ -812,8 +831,9 @@ static void *h3_dit_early_load_run(void *opaque) {
  * wrong guess only costs the early load: the DiT load then runs serially. */
 static void h3_predict_conditions(const h3_params *params, int ref2va,
                                   int *visual, int *audio) {
-    *visual = !ref2va && (params->first_frame || params->last_frame);
-    *audio = 0;
+    *visual = !ref2va && (params->first_frame || params->last_frame ||
+                          params->motion_context);
+    *audio = !ref2va && params->motion_context != NULL;
     for (size_t index = 0; ref2va && index < params->reference_count;
          index++) {
         const h3_reference *reference = &params->references[index];
@@ -865,6 +885,7 @@ typedef struct {
     h3_ffmpeg_av_stream *stream;
     double convert_seconds;
     int failed;
+    int trim; /* leading frames the stream does not carry */
 } h3_frame_delivery;
 
 static int h3_deliver_decoded_frames(const float *rgb, int first, int count,
@@ -895,7 +916,7 @@ static int h3_deliver_decoded_frames(const float *rgb, int first, int count,
             return 0;
         }
     }
-    h3_ffmpeg_av_stream_ready(delivery->stream, first + count);
+    h3_ffmpeg_av_stream_ready(delivery->stream, first + count - delivery->trim);
     delivery->convert_seconds += h3_seconds() - started;
     return 1;
 }
@@ -1058,6 +1079,9 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     h3_layout_ref *layout_references = NULL;
     int keyframes[2] = {0, 0};
     size_t keyframe_count = 0;
+    h3_motion_context motion;
+    memset(&motion, 0, sizeof(motion));
+    int chained = params->motion_context != NULL;
     float *condition_video_rows = NULL;
     h3_video_encoder *video_encoder = NULL;
     size_t condition_video_elements = 0;
@@ -1166,6 +1190,12 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     conditioning_hit = ctx->cache_enabled && ctx->conditioning_key &&
         !strcmp(ctx->conditioning_key, conditioning_key);
     char detail[512];
+    if (chained && !h3_motion_context_plan(params->motion_context, latent_h,
+                                           latent_w, &motion, detail,
+                                           sizeof(detail))) {
+        h3_set_error(ctx, "%s", detail);
+        goto cleanup;
+    }
     if (conditioning_hit) {
         size_t cached_reference_count = 0;
         if (!h3_conditioning_cache_load(
@@ -1420,6 +1450,26 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             if (progress.cancelled) goto cleanup;
         }
     } else {
+        if (chained) {
+            if (!h3_motion_context_encode(
+                    &motion, params->motion_context, render_width,
+                    render_height, vae_path, audio_vae_path, "h3_shaders.metal",
+                    h3_video_encoder_progress_bridge, &progress,
+                    h3_audio_encoder_progress_bridge, &progress,
+                    detail, sizeof(detail))) {
+                h3_set_error(ctx, "%s", detail);
+                goto cleanup;
+            }
+            /* The head rows lead the visual conditions; a last-frame anchor
+             * follows them, matching the layout's segment order. */
+            condition_video_rows = motion.video_rows;
+            condition_video_elements = motion.video_elements;
+            condition_audio_rows = motion.audio_rows;
+            condition_audio_elements = motion.audio_elements;
+            motion.video_rows = NULL;
+            motion.audio_rows = NULL;
+            if (progress.cancelled) goto cleanup;
+        }
         if (params->first_frame) {
             keyframes[keyframe_count++] = 0;
             /* Center-crop to the render aspect ratio instead of stretching,
@@ -1462,6 +1512,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     }
 
     if (visual_count) {
+        size_t head_elements = condition_video_elements;
         for (size_t image = 0; image < visual_count; image++) {
             int image_latent_w, image_latent_h;
             h3_latent_canvas(condition_widths[image], condition_heights[image],
@@ -1482,12 +1533,14 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             h3_set_error(ctx, "condition storage size overflows");
             goto cleanup;
         }
-        condition_video_rows = malloc(condition_video_elements *
-                                      sizeof(*condition_video_rows));
-        if (!condition_video_rows) {
+        float *grown = realloc(condition_video_rows,
+                               condition_video_elements *
+                               sizeof(*condition_video_rows));
+        if (!grown) {
             h3_set_error(ctx, "out of memory allocating visual condition rows");
             goto cleanup;
         }
+        condition_video_rows = grown;
         /* One Metal context, weight load and graph set for every anchor. */
         video_encoder = h3_video_encoder_open(vae_path, "h3_shaders.metal",
                                               detail, sizeof(detail));
@@ -1495,7 +1548,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             h3_set_error(ctx, "%s", detail);
             goto cleanup;
         }
-        size_t condition_offset = 0;
+        size_t condition_offset = head_elements;
         for (size_t image = 0; image < visual_count; image++) {
             int image_latent_w, image_latent_h;
             h3_latent_canvas(condition_widths[image], condition_heights[image],
@@ -1635,7 +1688,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             goto cleanup;
         }
     }
-    conditioned = visual_count != 0 || condition_audio_elements != 0;
+    conditioned = visual_count != 0 || condition_video_elements != 0 ||
+                  condition_audio_elements != 0;
     if (ctx->cache_enabled) {
         if (!h3_conditioning_cache_store(
                 ctx, conditioning_key, &text,
@@ -1650,6 +1704,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     }
     if (conditioned && !h3_augment_conditions(
             params, ref2va, render_width, render_height, layout_references,
+            chained ? &motion : NULL,
             condition_video_rows, condition_video_elements,
             condition_audio_rows, condition_audio_elements)) {
         h3_set_error(ctx, "cannot apply seeded condition augmentation");
@@ -1661,7 +1716,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
                            latent_w, temporal.audio_t, temporal.frame_count,
                            keyframes, keyframe_count,
                            layout_references,
-                           ref2va ? params->reference_count : 0};
+                           ref2va ? params->reference_count : 0,
+                           motion.steps, motion.audio_t, motion.audio_offset};
     if (!h3_layout_build(&spec, &layout, detail, sizeof(detail))) {
         h3_set_error(ctx, "%s", detail);
         goto cleanup;
@@ -1888,6 +1944,13 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             fprintf(stderr, "h3: cannot write %s\n", dump_path);
         if (dump) fclose(dump);
     }
+    if (params->save_context && *params->save_context &&
+        !h3_motion_context_save(params->save_context, video, temporal.video_t,
+                                latent_h, latent_w, audio, temporal.audio_t,
+                                temporal.frame_count, detail, sizeof(detail))) {
+        h3_set_error(ctx, "%s", detail);
+        goto cleanup;
+    }
     double audio_started = h3_seconds();
     h3_progress_emit(&progress, "audio VAE", 0, 7);
     if (!h3_audio_vae_decode(audio_vae_path, "h3_shaders.metal", audio,
@@ -1899,6 +1962,29 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     free(audio);
     audio = NULL;
     if (progress.cancelled) goto cleanup;
+    /* Motion context: the pinned head is the previous clip's tail, so it
+     * leaves the delivery; the sound is cut to the remaining frames. */
+    int trim_frames = chained ? motion.frames : 0;
+    if (trim_frames) {
+        float *trimmed = NULL;
+        int trimmed_samples = 0;
+        if (!h3_motion_context_trim_pcm(
+                waveform.pcm, waveform.channels, waveform.samples,
+                waveform.sample_rate, temporal.frame_count, trim_frames,
+                &trimmed, &trimmed_samples)) {
+            h3_set_error(ctx, "cannot trim the motion context head from the audio");
+            goto cleanup;
+        }
+        free(waveform.pcm);
+        waveform.pcm = trimmed;
+        waveform.samples = trimmed_samples;
+        if (getenv("H3_PROFILE"))
+            fprintf(stderr, "h3 profile: motion context pinned %d frames "
+                    "(%d latent steps) and %d audio steps from %+.0f; "
+                    "delivering %d frames\n", motion.frames, motion.steps,
+                    motion.audio_t, motion.audio_offset,
+                    temporal.frame_count - trim_frames);
+    }
     double audio_finished = h3_seconds();
     if (!preview_decoder && !ctx->cache_enabled && prefetch.decoder) {
         /* Single-shot run: use the prefetched decoder once, freed below. */
@@ -1953,11 +2039,14 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             goto cleanup;
         }
         h3_frame_delivery delivery = {
-            rgb8, frame_count, output_width, output_height, NULL, 0.0, 0
+            rgb8, frame_count, output_width, output_height, NULL, 0.0, 0,
+            trim_frames
         };
         if (params->output_path && *params->output_path) {
             output_stream = h3_ffmpeg_av_stream_open(
-                params->output_path, rgb8, frame_count, output_width,
+                params->output_path,
+                rgb8 + (size_t)trim_frames * output_width * output_height * 3,
+                frame_count - trim_frames, output_width,
                 output_height, H3_FPS, waveform.pcm, waveform.samples,
                 waveform.channels, waveform.sample_rate,
                 detail, sizeof(detail));
@@ -2029,10 +2118,11 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     }
     if (params->on_frame) {
         size_t frame_bytes = (size_t)output_width * (size_t)output_height * 3;
-        for (int index = 0; index < frame_count; index++) {
+        for (int index = trim_frames; index < frame_count; index++) {
             h3_frame frame = {output_width, output_height, output_width * 3,
                               rgb8 + (size_t)index * frame_bytes,
-                              index, frame_count, -1, 0};
+                              index - trim_frames, frame_count - trim_frames,
+                              -1, 0};
             if (params->on_frame(&frame, params->callback_opaque)) {
                 h3_set_error(ctx, "generation cancelled while delivering frame %d",
                              index);
@@ -2051,7 +2141,9 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
                                                  sizeof(detail));
         } else {
             written = h3_ffmpeg_write_av_rgb24_f32(
-                params->output_path, rgb8, frame_count, output_width,
+                params->output_path,
+                rgb8 + (size_t)trim_frames * output_width * output_height * 3,
+                frame_count - trim_frames, output_width,
                 output_height, H3_FPS, waveform.pcm, waveform.samples,
                 waveform.channels, waveform.sample_rate,
                 detail, sizeof(detail));
@@ -2083,7 +2175,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     }
     result->width = output_width;
     result->height = output_height;
-    result->frames = frame_count;
+    result->frames = frame_count - trim_frames;
     result->fps = H3_FPS;
     result->sample_rate = waveform.sample_rate;
     result->seed = params->seed;
@@ -2131,6 +2223,7 @@ cleanup:
     free(video); free(audio); free(rgb8);
     h3_video_frames_free(&frames);
     h3_audio_waveform_free(&waveform);
+    h3_motion_context_free(&motion);
     return result;
 }
 
