@@ -91,7 +91,13 @@ machines where that does not fit.
 | H.264 `-preset slow` | [#70](https://github.com/antirez/h3.c/issues/70) | The fast preset added its own blocking on top of the decoded frames. CRF stays 18 |
 | Sol-Attn block-sparse attention, opt-in | [AlexanderIstomin/h3.c](https://github.com/AlexanderIstomin/h3.c) `perf/h3-sol-attn-metal`, compiler fixes from [fzeng656/h3.c](https://github.com/fzeng656/h3.c); kernel by [yshenaw](https://github.com/yshenaw/ComfyUI-SolAttn-MPS) | Attention is the bulk of the denoise at production shapes and no dense kernel beats MPSGraph there. See below |
 
-### Sol-Attn (experimental)
+### Sol-Attn (experimental, not recommended on this machine)
+
+Measured 2026-10-21 on the M5 Pro int8 lane: at tau 1.3 it is 3 to 13% faster
+than dense and visibly drifts the set and hands; at a denser tau it is slower
+than dense. Kept as a flag for other machines and for the Morton-ordering
+experiment; see `docs/bench-2026-10-21.md`.
+
 
 `H3_SOL_ATTN=1` loads `h3_sol_attention.metal` beside the main shaders and
 routes the DiT's self-attention through a training-free 64-token block-sparse
