@@ -108,14 +108,16 @@ rows that end at the join, so the model continues the motion and the sound
 rather than restaging them. The pinned head is then trimmed from the
 delivered clip: a `--seconds 5` continuation delivers 22 frames (0.917 s)
 less than requested, and the clips concatenate. `--motion-context` also
-accepts a finished video; its tail is then decoded and re-encoded with the
-released VAEs (a lossy round trip, and the audio window is placed as if the
-clip's sound had been cut at its last frame). Both clips must share the
-canvas. Motion context cannot be combined with `--first-frame` or with
+accepts a finished video, whose tail is decoded and re-encoded with the
+released VAEs; measured on the bench shot that round trip lands the picture
+rows at cosine 0.97 to the true latents and the sound rows at 0.71, and the
+model restaged (a cut, r 0.82), where the context file continued (r 0.99).
+Chain through `--save-context` files. Both clips must share the canvas. Motion context cannot be combined with `--first-frame` or with
 Ref2VA references; `--last-frame` still works. Keep links at 8 to 10
 seconds: in ComfyUI the same 22-frame pin held a 10 s join and lost a 15 s
-one. `--profile` prints the pinned run, the audio window and the delivered
-length.
+one. The head adds its rows to every attention step: 32% more denoise on the
+124-frame bench shot. `--profile` prints the pinned run, the audio window and
+the delivered length. Numbers: `docs/bench-2026-10-21.md`.
 
 ### Sol-Attn (experimental, not recommended on this machine)
 

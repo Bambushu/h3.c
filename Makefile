@@ -231,3 +231,6 @@ clean:
 		h3_real_video_vae_test h3_semantic_vae_test \
 	h3_dit_bench h3_dit_bench_864 vae_bench h3_vae_encoder_bench \
 	libh3.a *.o *.d tests/*.o tests/*.d tools/*.o tools/*.d
+
+mc_probe: tools/mc_probe.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
