@@ -8,7 +8,7 @@
 #include <unistd.h>
 
 enum { FLAT_OUTPUT, FLAT_FIRST, FLAT_LAST, FLAT_MOTION, FLAT_SAVE,
-       FLAT_STRINGS };
+       FLAT_LORA, FLAT_STRINGS };
 
 struct h3_flat_params {
     h3_params params;
@@ -94,8 +94,10 @@ int h3_flat_params_set_u64(h3_flat_params *flat, const char *name,
 
 int h3_flat_params_set_double(h3_flat_params *flat, const char *name,
                               double value) {
-    if (!flat || !name || strcmp(name, "video_shift")) return 0;
-    flat->params.video_shift = value;
+    if (!flat || !name) return 0;
+    if (!strcmp(name, "video_shift")) flat->params.video_shift = value;
+    else if (!strcmp(name, "lora_scale")) flat->params.lora_scale = value;
+    else return 0;
     return 1;
 }
 
@@ -108,7 +110,7 @@ int h3_flat_params_set_string(h3_flat_params *flat, const char *name,
     if (!flat || !name) return 0;
     static const char *const names[FLAT_STRINGS] = {
         "output_path", "first_frame", "last_frame", "motion_context",
-        "save_context"
+        "save_context", "lora_path"
     };
     for (int i = 0; i < FLAT_STRINGS; i++) {
         if (strcmp(name, names[i])) continue;
@@ -184,6 +186,7 @@ h3_result *h3_flat_generate(h3_ctx *ctx, const char *prompt,
     params.last_frame = flat->strings[FLAT_LAST];
     params.motion_context = flat->strings[FLAT_MOTION];
     params.save_context = flat->strings[FLAT_SAVE];
+    params.lora_path = flat->strings[FLAT_LORA];
     params.references = flat->references;
     params.reference_count = flat->reference_count;
     params.on_frame = flat->on_frame ? flat_frame_trampoline : NULL;

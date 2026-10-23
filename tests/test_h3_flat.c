@@ -38,6 +38,13 @@ int main(void) {
     CHECK(h3_flat_params_set_double(flat, "video_shift", 7.5) &&
           p->video_shift == 7.5);
     CHECK(!h3_flat_params_set_double(flat, "shift", 7.5));
+    CHECK(p->lora_scale == 1.0);  /* H3_PARAMS_DEFAULT */
+    CHECK(h3_flat_params_set_double(flat, "lora_scale", 0.75) &&
+          p->lora_scale == 0.75);
+    CHECK(h3_flat_params_set_string(flat, "lora_path", "/a/turbo.safetensors"));
+    CHECK(!strcmp(flat->strings[FLAT_LORA], "/a/turbo.safetensors"));
+    CHECK(h3_flat_params_set_string(flat, "lora_path", NULL));
+    CHECK(flat->strings[FLAT_LORA] == NULL);
 
     char scratch[32] = "/tmp/a.h3ctx";
     CHECK(h3_flat_params_set_string(flat, "save_context", scratch));

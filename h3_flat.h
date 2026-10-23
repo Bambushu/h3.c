@@ -33,9 +33,9 @@ void h3_flat_params_free(h3_flat_params *params);
  * core_reuse token_reduction use_int8_row_fc2 use_reference_rope
  * ssd_streaming render_width render_height preview_denoise sampler scheduler
  * reference_image_size (and the use_slower_* switches).
- * u64: seed.  double: video_shift.
+ * u64: seed.  double: video_shift lora_scale.
  * string (NULL or "" clears): output_path first_frame last_frame
- * motion_context save_context. */
+ * motion_context save_context lora_path. */
 int h3_flat_params_set_int(h3_flat_params *params, const char *name, int value);
 int h3_flat_params_set_u64(h3_flat_params *params, const char *name,
                            uint64_t value);
