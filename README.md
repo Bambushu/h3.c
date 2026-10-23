@@ -53,7 +53,7 @@ Opt-in, unchanged unless enabled:
 | --- | --- | --- |
 | [#73](https://github.com/antirez/h3.c/pull/73) | **on by default here**: `H3_VAE_PRECISION=f32` and `H3_VAE_PREFETCH=0` restore the released path; `H3_VAE_CACHE=<dir>` is opt-in | BF16 video VAE decode (3 to 4x faster on an M5 Pro, 63 dB against F32 on the same latents), decoder load overlapped with the denoise, cached lowered weights. Prefetch and cache are bit-identical |
 | [#64](https://github.com/antirez/h3.c/pull/64) | `H3_SDPA_MAX_QUERY_ROWS=2048` or `--sdpa-query-block 2048` | Splits long non-causal SDPA queries to avoid MPSGraph corruption on M2/M3 Ultra. Off by default here (upstream PR defaults on) |
-| [#14](https://github.com/antirez/h3.c/pull/14) | `tools/fold_turbo_lora.py` | Offline tool and docs only: fold a step-distillation LoRA into a separate checkpoint for 5-6 step sampling |
+| [#14](https://github.com/antirez/h3.c/pull/14) | `tools/fold_turbo_lora.py` | Offline tool: fold a step-distillation LoRA into a separate checkpoint for 5-6 step sampling. `--lora` now applies it at load instead |
 
 jerryfane measured on a Mac Studio M5 Ultra (256 GB), draft (864×480, 56
 frames, `--steps 8 --layers 50 --reuse 1`) and standard (1344×768, 56 frames,
@@ -89,6 +89,7 @@ machines where that does not fit.
 | `--first-frame` center-crops to the render aspect | [JunzoKamahara/h3.c](https://github.com/JunzoKamahara/h3.c) b17de03 | It stretched while `--last-frame` cropped; plates whose aspect differed from the canvas were squashed |
 | H.264 `-preset slow` | [#70](https://github.com/antirez/h3.c/issues/70) | The fast preset added its own blocking on top of the decoded frames. CRF stays 18 |
 | `--motion-context` / `--save-context`: chain clips on the previous take's latent tail | after [ComfyUI-H3-Motion-Context](https://github.com/NikoDemon80/ComfyUI-H3-Motion-Context) | A reference video of the previous clip restages the shot (measured: a jump cut, and twice the rows). Pinning the last 22 frames and 0.9 s of sound at the head of the next generation continues it, with the same `--ref-image` identity references alongside; see below |
+| `--lora PATH [--lora-scale S]`: a DiT adapter applied at load | this fork | The Turbo step-distillation LoRA as a 5-6 step lane on the same BF16 checkpoint, instead of a second folded 62 GB transformer; its int8 cache is built once beside the base one. See [Distilled sampling](#distilled-sampling-the-turbo-lora-at-load-time) |
 | Sol-Attn block-sparse attention, opt-in | [AlexanderIstomin/h3.c](https://github.com/AlexanderIstomin/h3.c) `perf/h3-sol-attn-metal`, compiler fixes from [fzeng656/h3.c](https://github.com/fzeng656/h3.c); kernel by [yshenaw](https://github.com/yshenaw/ComfyUI-SolAttn-MPS) | Attention is the bulk of the denoise at production shapes and no dense kernel beats MPSGraph there. See below |
 
 ### Motion context: continuing a take
@@ -580,31 +581,51 @@ Standalone audio must accompany an image or video reference. Audio references
 must be 2–45 seconds; at most three audio inputs are accepted and their total
 decoded duration is capped at 45 seconds.
 
-## Distilled sampling: fold the Turbo LoRA into the checkpoint
+## Distilled sampling: the Turbo LoRA at load time
 
-h3.c does not implement a LoRA runtime; step-distillation adapters can instead
-be folded into the checkpoint before inference. `tools/fold_turbo_lora.py`
-applies
+`--lora PATH [--lora-scale S]` applies a DiT adapter while the weights load,
+so one BF16 checkpoint serves both a quality lane (base weights, 14-20 steps)
+and a speed lane (the step-distillation adapter, 5-6 steps). The adapter is
 [larryvrh/MiniMax-H3-Turbo-Lora](https://huggingface.co/larryvrh/MiniMax-H3-Turbo-Lora)
-directly to the bf16 shards. The adapter file,
-`minimax_h3_turbo_v4_step600_ema.safetensors`, is Apache-2.0 and remains subject
-to the MiniMax H3 Community License as a derivative. The tool clones the
-original shards and patches only the affected byte ranges. The headers and
-tensor order remain unchanged, as does their alignment:
+`minimax_h3_turbo_v4_step600_ema.safetensors` (780 MB, Apache-2.0, and subject
+to the MiniMax H3 Community License as a derivative):
 
 ```sh
-python3 tools/fold_turbo_lora.py \
-  --checkpoint ./MiniMax-H3/FL2VA/transformer \
-  --lora ./minimax_h3_turbo_v4_step600_ema.safetensors \
-  --out ./MiniMax-H3-turbo/FL2VA/transformer
+./h3 -d ./MiniMax-H3 -p "$(cat shot.txt)" --seconds 5 --steps 6 \
+  --lora ./minimax_h3_turbo_v4_step600_ema.safetensors -o shot_turbo.mp4
 ```
 
-Point `-d` at a model directory whose `FL2VA/transformer` contains the folded
-tree; everything else can be symlinked to the original snapshot. Sample with
-`--steps 5` or `--steps 6` and no other speed flags. The distilled schedule
-removes the redundancy used by `--reuse` and `--core-reuse`, so neither option
-should be combined with it. On fast action, 4 steps showed motion smear; 5 is
-the validated floor.
+For every tensor the adapter targets (`<target>.lora_A.weight` [rank, in] and
+`<target>.lora_B.weight` [out, rank] over the checkpoint's key space; the Turbo
+adapter covers 259 tensors, 66.1 of the 66.3 GB transformer) the loader computes
+W' = W + scale * (B @ A) in F32 with one Accelerate SGEMM and rounds to BF16
+nearest-even before the int8 quantizer sees it. Tensors that stay BF16 (AdaLN,
+token refiner, final layer) get the same delta. The result is byte-identical to
+folding the adapter offline: `make lora_check` and
+`./lora_check BASE/transformer FOLDED/transformer ADAPTER` compares all 259
+tensors (0 of 33.07 G elements differ against `tools/fold_turbo_lora.py`).
+
+The adapter's content hash and scale key and name the `H3_DIT_CACHE` files, so
+the base and the adapted int8 caches sit side by side in
+`~/Library/Caches/h3c/dit` (18 GiB each) and each is built once; later loads
+map either one. A LoRA cannot be combined with `--ssd-streaming`, which streams
+unmodified checkpoint bytes.
+
+Sample with `--steps 5` or `--steps 6` and no other speed flags. The distilled
+schedule removes the redundancy used by `--reuse` and `--core-reuse`, so neither
+option should be combined with it. On fast action, 4 steps showed motion smear;
+5 is the validated floor.
+
+Measured on an M5 Pro 48 GB (2026-10-23; 544x960, 1 s, 6 steps, seed 42,
+`H3_PROFILE=1`): the first `--lora` run quantized and cached the adapted DiT in
+102 s (AdaLN 36 s, blocks 64 s), against 98 s for the same cold build from the
+folded checkpoint; later runs mapped it in 6.9 s. All 50 int8 block files and
+the AdaLN file match the folded checkpoint's byte for byte, and the MP4s are
+identical (same MD5), from the CLI and from `libh3`. The base cache written
+before this change still maps (50/50, 8.4 s): unadapted keys are unchanged.
+
+`tools/fold_turbo_lora.py` still writes a folded copy of the checkpoint for
+other runtimes; h3.c no longer needs one.
 
 Cold single-shot measurements on an M5 Max used 960x544 and an identical prompt
 and seed. The comparison is against the tutorial's
@@ -877,6 +898,8 @@ Files are keyed by:
 - the block index and the set of stored matrices;
 - the Metal device and TensorOps mode, the macOS build, the shader source
   content, `H3_INT8_VECTOR_QUANT` and a format version;
+- with `--lora`, the adapter file's content hash and the scale, which also
+  rename the files so base and adapted caches coexist;
 - for AdaLN files only: the step count, every sigma bit, and the visual/audio
   condition flags.
 
