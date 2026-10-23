@@ -1635,7 +1635,7 @@ int main(int argc, char **argv) {
         if (!video_condition || !audio_condition)
             die("out of memory allocating reference conditions");
         dit = h3_dit_load_conditioned(
-            weights, "h3_shaders.metal", &text, &layout, &sigmas,
+            weights, NULL, "h3_shaders.metal", &text, &layout, &sigmas,
             active_blocks, 1, enable_token_reduction, ssd_streaming, 1.0f,
             all_bf16, all_bf16, all_bf16, 0, 0, 0, 0, 0, 0,
             use_slower_grouped_quantizer, use_int8_row_fc2,
@@ -1646,7 +1646,7 @@ int main(int argc, char **argv) {
         free(audio_condition);
     } else {
         dit = h3_dit_load_t2va(
-            weights, "h3_shaders.metal", &text, &layout, &sigmas,
+            weights, NULL, "h3_shaders.metal", &text, &layout, &sigmas,
             active_blocks, 1, enable_token_reduction, ssd_streaming, 1.0f,
             all_bf16, all_bf16, all_bf16, 0, 0, 0, 0, 0, 0,
             use_slower_grouped_quantizer, use_int8_row_fc2,

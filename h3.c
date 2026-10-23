@@ -173,20 +173,21 @@ static double h3_video_shift(const h3_params *params) {
 
 static char *h3_prepared_key(const char *conditioning,
                              const h3_params *params,
-                             int render_width, int render_height) {
+                             int render_width, int render_height,
+                             uint64_t lora_key) {
     h3_key key = {0};
     if (!h3_key_append(
             &key,
             "%s|shape=%dx%dx%d|steps=%d|scheduler=%d|shift=%.9g|layers=%d"
             "|reuse-core=%d|reduce=%d"
-            "|row-fc2=%d|reference-rope=%d|ssd-streaming=%d"
+            "|row-fc2=%d|reference-rope=%d|ssd-streaming=%d|lora=%016llx"
             "|slow=%d%d%d%d%d%d%d%d%d%d",
             conditioning, render_width, render_height, params->frames,
             params->steps, params->scheduler, h3_video_shift(params),
             params->dit_layers, params->core_reuse,
             params->token_reduction, params->use_int8_row_fc2,
             params->use_reference_rope,
-            params->ssd_streaming,
+            params->ssd_streaming, (unsigned long long)lora_key,
             params->use_slower_bf16_mlp,
             params->use_slower_bf16_qkv,
             params->use_slower_bf16_attention_output,
@@ -488,6 +489,7 @@ h3_ctx *h3_load_dir(const char *model_dir) {
 void h3_free(h3_ctx *ctx) {
     if (!ctx) return;
     h3_cache_clear(ctx);
+    h3_lora_free(ctx->lora);
     free(ctx->model_dir);
     free(ctx);
 }
@@ -603,6 +605,17 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
     if (params->ssd_streaming && params->use_int8_row_fc2) {
         h3_set_error(ctx, "SSD streaming uses original BF16 weights and cannot "
                          "be combined with int8 row FC2");
+        return 0;
+    }
+    if (params->lora_path &&
+        (!*params->lora_path || !isfinite(params->lora_scale) ||
+         params->lora_scale == 0.0)) {
+        h3_set_error(ctx, "a LoRA needs a path and a finite nonzero scale");
+        return 0;
+    }
+    if (params->lora_path && params->ssd_streaming) {
+        h3_set_error(ctx, "SSD streaming reads original BF16 weights and "
+                         "cannot be combined with a LoRA");
         return 0;
     }
     if (params->use_int8_row_fc2 && params->use_slower_bf16_mlp) {
@@ -802,6 +815,7 @@ static void *h3_dit_free_run(void *opaque) {
  * serial load below runs as before. */
 typedef struct {
     const char *weight_directory;
+    const h3_lora *lora;
     h3_sigma_schedule sigmas;
     unsigned active_blocks;
     int visual_condition;
@@ -817,7 +831,7 @@ typedef struct {
 static void *h3_dit_early_load_run(void *opaque) {
     h3_dit_early_load *job = opaque;
     job->core = h3_dit_core_load(
-        job->weight_directory, "h3_shaders.metal", &job->sigmas,
+        job->weight_directory, job->lora, "h3_shaders.metal", &job->sigmas,
         job->active_blocks, job->visual_condition, job->audio_condition,
         job->ssd_streaming, job->use_slower_bf16_mlp,
         job->use_slower_bf16_qkv, job->use_slower_bf16_attention_output,
@@ -1113,6 +1127,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     h3_result *result = NULL;
     char *conditioning_key = NULL;
     char *prepared_key = NULL;
+    h3_lora *lora = NULL;
     char *decoder_key = NULL;
     int conditioning_hit = 0;
     int conditioned = 0;
@@ -1139,8 +1154,20 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         h3_set_error(ctx, "out of memory constructing conditioning cache key");
         goto cleanup;
     }
+    if (params->lora_path) {
+        char lora_error[512];
+        lora = h3_lora_open(params->lora_path, (float)params->lora_scale,
+                            lora_error, sizeof(lora_error));
+        if (!lora) {
+            h3_set_error(ctx, "%s", lora_error);
+            goto cleanup;
+        }
+        fprintf(stderr, "h3: LoRA %s: %zu tensors, scale %g\n",
+                params->lora_path, h3_lora_pairs(lora), params->lora_scale);
+    }
     prepared_key = h3_prepared_key(
-        conditioning_key, params, render_width, render_height);
+        conditioning_key, params, render_width, render_height,
+        h3_lora_key(lora));
     if (!prepared_key) {
         h3_set_error(ctx, "out of memory constructing prepared-model cache key");
         goto cleanup;
@@ -1166,6 +1193,15 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         free(ctx->dit_key);
         ctx->dit_key = NULL;
     }
+    /* A retained DiT keeps the adapter object it was loaded with (the key
+     * proves the same content); otherwise this request's adapter takes over. */
+    if (ctx->dit) {
+        h3_lora_free(lora);
+    } else {
+        h3_lora_free(ctx->lora);
+        ctx->lora = lora;
+    }
+    lora = NULL;
     const char *early_flag = getenv("H3_DIT_EARLY_LOAD");
     if (early_flag && *early_flag && strcmp(early_flag, "0") &&
         !(ctx->cache_enabled && ctx->dit && ctx->dit_key &&
@@ -1174,6 +1210,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
                                           h3_video_shift(params),
                                           &early.sigmas)) {
         early.weight_directory = dit_path;
+        early.lora = ctx->lora;
         early.active_blocks = (unsigned)params->dit_layers;
         h3_predict_conditions(params, ref2va, &early.visual_condition,
                               &early.audio_condition);
@@ -1764,7 +1801,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         h3_dit_core *core = early.core;
         early.core = NULL;
         dit = h3_dit_load_with_core(
-            core, dit_path, "h3_shaders.metal", &text, &layout, &sigmas,
+            core, dit_path, ctx->lora, "h3_shaders.metal", &text, &layout,
+            &sigmas,
             (unsigned)params->dit_layers, (unsigned)params->core_reuse,
             params->token_reduction,
             params->ssd_streaming,
@@ -1785,7 +1823,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             h3_dit_progress_bridge, &progress, detail, sizeof(detail));
     } else if (conditioned) {
         dit = h3_dit_load_conditioned(
-            dit_path, "h3_shaders.metal", &text, &layout, &sigmas,
+            dit_path, ctx->lora, "h3_shaders.metal", &text, &layout,
+            &sigmas,
             (unsigned)params->dit_layers, (unsigned)params->core_reuse,
             params->token_reduction,
             params->ssd_streaming,
@@ -1806,7 +1845,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             h3_dit_progress_bridge, &progress, detail, sizeof(detail));
     } else {
         dit = h3_dit_load_t2va(
-            dit_path, "h3_shaders.metal", &text, &layout, &sigmas,
+            dit_path, ctx->lora, "h3_shaders.metal", &text, &layout,
+            &sigmas,
             (unsigned)params->dit_layers, (unsigned)params->core_reuse,
             params->token_reduction,
             params->ssd_streaming,
@@ -2193,6 +2233,7 @@ cleanup:
     /* Before rgb8 is freed: the FFmpeg feeder reads it until stopped. */
     h3_ffmpeg_av_stream_abort(output_stream);
     h3_dit_core_free(early.core);
+    h3_lora_free(lora);
     free(conditioning_key);
     free(prepared_key);
     free(decoder_key);

@@ -1,14 +1,37 @@
+#define ACCELERATE_NEW_LAPACK
+#define ACCELERATE_LAPACK_ILP64
 #include "h3_weights.h"
 
+#include <Accelerate/Accelerate.h>
 #include <dirent.h>
+#include <fcntl.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+typedef struct {
+    char *target;
+    const h3_st_tensor *a;  /* [rank, columns] */
+    const h3_st_tensor *b;  /* [rows, rank] */
+} h3_lora_pair;
+
+struct h3_lora {
+    h3_st_header header;
+    h3_lora_pair *pairs;
+    size_t count;
+    float scale;
+    uint64_t key;
+};
 
 struct h3_weight_store {
     h3_st_header *headers;
     size_t count;
+    const h3_lora *lora;
 };
 
 static void fail(char *error, size_t error_size, const char *format, ...) {
@@ -17,6 +40,219 @@ static void fail(char *error, size_t error_size, const char *format, ...) {
     va_start(arguments, format);
     vsnprintf(error, error_size, format, arguments);
     va_end(arguments);
+}
+
+static int compare_pairs(const void *left, const void *right) {
+    const h3_lora_pair *a = left;
+    const h3_lora_pair *b = right;
+    return strcmp(a->target, b->target);
+}
+
+static const h3_lora_pair *find_pair(const h3_lora *lora, const char *name) {
+    if (!lora || !name) return NULL;
+    h3_lora_pair probe = {(char *)name, NULL, NULL};
+    return bsearch(&probe, lora->pairs, lora->count, sizeof(*lora->pairs),
+                   compare_pairs);
+}
+
+static int lora_factor(const h3_st_tensor *tensor) {
+    return tensor->ndim == 2 && tensor->shape[0] && tensor->shape[1] &&
+           (tensor->dtype == H3_DTYPE_BF16 || tensor->dtype == H3_DTYPE_F32);
+}
+
+/* FNV-1a over 64-bit words of the file, then its length and the scale. A
+ * cache key, not a checksum: it only has to change when the adapter does. */
+static int hash_file_words(const char *path, uint64_t *hash,
+                           char *error, size_t error_size) {
+    int descriptor = open(path, O_RDONLY | O_CLOEXEC);
+    struct stat info;
+    if (descriptor < 0 || fstat(descriptor, &info) != 0 || info.st_size <= 0) {
+        if (descriptor >= 0) close(descriptor);
+        fail(error, error_size, "cannot open LoRA %s", path);
+        return 0;
+    }
+    size_t length = (size_t)info.st_size;
+    const unsigned char *bytes = mmap(NULL, length, PROT_READ, MAP_PRIVATE,
+                                      descriptor, 0);
+    close(descriptor);
+    if (bytes == MAP_FAILED) {
+        fail(error, error_size, "cannot map LoRA %s", path);
+        return 0;
+    }
+    uint64_t value = UINT64_C(14695981039346656037);
+    size_t at = 0;
+    for (; at + sizeof(uint64_t) <= length; at += sizeof(uint64_t)) {
+        uint64_t word;
+        memcpy(&word, bytes + at, sizeof(word));
+        value = (value ^ word) * UINT64_C(1099511628211);
+    }
+    for (; at < length; at++)
+        value = (value ^ bytes[at]) * UINT64_C(1099511628211);
+    munmap((void *)bytes, length);
+    *hash = (value ^ (uint64_t)length) * UINT64_C(1099511628211);
+    return 1;
+}
+
+h3_lora *h3_lora_open(const char *path, float scale,
+                      char *error, size_t error_size) {
+    if (!path || !*path || !isfinite(scale) || scale == 0.0f) {
+        fail(error, error_size, "LoRA needs a path and a finite nonzero scale");
+        return NULL;
+    }
+    h3_lora *lora = calloc(1, sizeof(*lora));
+    if (!lora) {
+        fail(error, error_size, "out of memory opening LoRA");
+        return NULL;
+    }
+    lora->scale = scale;
+    char detail[384];
+    if (!h3_st_read_header(path, &lora->header, detail, sizeof(detail))) {
+        fail(error, error_size, "%s", detail);
+        free(lora);
+        return NULL;
+    }
+    static const char suffix_a[] = ".lora_A.weight";
+    static const char suffix_b[] = ".lora_B.weight";
+    size_t length_a = sizeof(suffix_a) - 1;
+    lora->pairs = calloc(lora->header.tensor_count ? lora->header.tensor_count : 1,
+                         sizeof(*lora->pairs));
+    if (!lora->pairs) goto out_of_memory;
+    for (size_t index = 0; index < lora->header.tensor_count; index++) {
+        const h3_st_tensor *a = &lora->header.tensors[index];
+        size_t length = strlen(a->name);
+        if (length <= length_a || strcmp(a->name + length - length_a, suffix_a))
+            continue;
+        size_t stem = length - length_a;
+        char *name = malloc(stem + sizeof(suffix_b));
+        if (!name) goto out_of_memory;
+        memcpy(name, a->name, stem);
+        memcpy(name + stem, suffix_b, sizeof(suffix_b));
+        const h3_st_tensor *b = h3_st_find(&lora->header, name);
+        if (!b || !lora_factor(a) || !lora_factor(b) ||
+            b->shape[1] != a->shape[0]) {
+            fail(error, error_size, "LoRA %s: %s has no matching %s pair",
+                 path, a->name, b ? "rank" : suffix_b + 1);
+            free(name);
+            h3_lora_free(lora);
+            return NULL;
+        }
+        memcpy(name + stem, ".weight", sizeof(".weight"));
+        lora->pairs[lora->count++] = (h3_lora_pair){name, a, b};
+    }
+    if (!lora->count) {
+        fail(error, error_size, "LoRA %s has no .lora_A/.lora_B pairs", path);
+        h3_lora_free(lora);
+        return NULL;
+    }
+    qsort(lora->pairs, lora->count, sizeof(*lora->pairs), compare_pairs);
+    uint64_t hash;
+    if (!hash_file_words(path, &hash, error, error_size)) {
+        h3_lora_free(lora);
+        return NULL;
+    }
+    uint32_t bits;
+    memcpy(&bits, &scale, sizeof(bits));
+    lora->key = (hash ^ bits) * UINT64_C(1099511628211);
+    return lora;
+
+out_of_memory:
+    fail(error, error_size, "out of memory opening LoRA");
+    h3_lora_free(lora);
+    return NULL;
+}
+
+void h3_lora_free(h3_lora *lora) {
+    if (!lora) return;
+    for (size_t index = 0; index < lora->count; index++)
+        free(lora->pairs[index].target);
+    free(lora->pairs);
+    h3_st_free_header(&lora->header);
+    free(lora);
+}
+
+size_t h3_lora_pairs(const h3_lora *lora) {
+    return lora ? lora->count : 0;
+}
+
+uint64_t h3_lora_key(const h3_lora *lora) {
+    return lora ? lora->key : 0;
+}
+
+static float bf16_value(uint16_t bits) {
+    uint32_t wide = (uint32_t)bits << 16;
+    float value;
+    memcpy(&value, &wide, sizeof(value));
+    return value;
+}
+
+/* Round to nearest even, as fold_turbo_lora.py's f32_to_bf16_bytes. */
+static uint16_t bf16_round(float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    return (uint16_t)((bits + 0x7FFFu + ((bits >> 16) & 1u)) >> 16);
+}
+
+static float *read_factor(const h3_lora *lora, const h3_st_tensor *tensor,
+                          char *error, size_t error_size) {
+    uint64_t elements = h3_st_tensor_elements(tensor);
+    size_t item = h3_dtype_size(tensor->dtype);
+    if (elements > SIZE_MAX / sizeof(float)) return NULL;
+    float *values = malloc((size_t)elements * sizeof(float));
+    if (!values) {
+        fail(error, error_size, "out of memory reading %s", tensor->name);
+        return NULL;
+    }
+    if (!h3_st_read_data(&lora->header, tensor, values,
+                         (size_t)elements * item, error, error_size)) {
+        free(values);
+        return NULL;
+    }
+    if (tensor->dtype == H3_DTYPE_BF16) {
+        const uint16_t *bits = (const uint16_t *)values;
+        for (size_t index = (size_t)elements; index-- > 0;)
+            values[index] = bf16_value(bits[index]);
+    }
+    return values;
+}
+
+int h3_lora_apply(const h3_lora *lora, const char *name, uint16_t *values,
+                  uint64_t rows, uint64_t columns,
+                  char *error, size_t error_size) {
+    const h3_lora_pair *pair = find_pair(lora, name);
+    if (!pair) return 0;
+    uint64_t rank = pair->a->shape[0];
+    if (!values || pair->b->shape[0] != rows || pair->a->shape[1] != columns ||
+        rows > SIZE_MAX / columns ||
+        rows * columns > SIZE_MAX / sizeof(float)) {
+        fail(error, error_size, "LoRA target %s has the wrong shape", name);
+        return -1;
+    }
+    size_t elements = (size_t)(rows * columns);
+    float *a = read_factor(lora, pair->a, error, error_size);
+    float *b = a ? read_factor(lora, pair->b, error, error_size) : NULL;
+    float *delta = b ? malloc(elements * sizeof(float)) : NULL;
+    if (!delta) {
+        if (b) fail(error, error_size, "out of memory adapting %s", name);
+        free(a);
+        free(b);
+        return -1;
+    }
+    /* One full-matrix SGEMM, as numpy's B @ A, so the F32 delta and hence
+     * the rounded BF16 weight match the offline fold bit for bit. */
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                (__LAPACK_int)rows, (__LAPACK_int)columns, (__LAPACK_int)rank,
+                1.0f, b, (__LAPACK_int)rank, a, (__LAPACK_int)columns,
+                0.0f, delta, (__LAPACK_int)columns);
+    float scale = lora->scale;
+    for (size_t index = 0; index < elements; index++) {
+        float scaled = scale * delta[index];
+        float adapted = bf16_value(values[index]) + scaled;
+        values[index] = bf16_round(adapted);
+    }
+    free(a);
+    free(b);
+    free(delta);
+    return 1;
 }
 
 static int safetensors_name(const char *name) {
@@ -113,6 +349,29 @@ h3_weight_store *h3_weight_store_open(const char *directory,
     return store;
 }
 
+h3_weight_store *h3_weight_store_open_lora(const char *directory,
+                                           const h3_lora *lora,
+                                           char *error, size_t error_size) {
+    h3_weight_store *store = h3_weight_store_open(directory, error, error_size);
+    if (!store || !lora) return store;
+    for (size_t index = 0; index < lora->count; index++) {
+        const h3_lora_pair *pair = &lora->pairs[index];
+        const h3_st_tensor *tensor = h3_weight_find(store, pair->target, NULL);
+        if (!tensor || tensor->dtype != H3_DTYPE_BF16 || tensor->ndim != 2 ||
+            tensor->shape[0] != pair->b->shape[0] ||
+            tensor->shape[1] != pair->a->shape[1]) {
+            fail(error, error_size, "LoRA target %s %s %s: wrong checkpoint "
+                 "or adapter?", pair->target,
+                 tensor ? "does not match a BF16 matrix in" : "is absent from",
+                 directory);
+            h3_weight_store_free(store);
+            return NULL;
+        }
+    }
+    store->lora = lora;
+    return store;
+}
+
 void h3_weight_store_free(h3_weight_store *store) {
     if (!store) return;
     for (size_t index = 0; index < store->count; index++) {
@@ -139,6 +398,33 @@ const h3_st_tensor *h3_weight_find(const h3_weight_store *store,
         }
     }
     return NULL;
+}
+
+/* An adapter target is read sequentially into its own buffer rather than
+ * mapped: rewriting a zero-copy mapping faults every page in from the file
+ * one at a time, about 25x slower than one streamed read. */
+static h3_gpu_tensor *load_adapted(const h3_weight_store *store, h3_gpu *gpu,
+                                   const h3_st_header *header,
+                                   const h3_st_tensor *tensor,
+                                   const char *name, const uint64_t *shape,
+                                   size_t elements,
+                                   char *error, size_t error_size) {
+    h3_gpu_tensor *result = h3_gpu_tensor_new_bf16(gpu, elements);
+    if (!result) {
+        fail(error, error_size, "cannot allocate %s: %s", name,
+             h3_gpu_error(gpu));
+        return NULL;
+    }
+    if (!h3_gpu_tensor_stream_file_bf16(result, header->path,
+                                        tensor->file_offset, elements,
+                                        error, error_size) ||
+        h3_lora_apply(store->lora, name,
+                      (uint16_t *)h3_gpu_tensor_contents(result),
+                      shape[0], shape[1], error, error_size) != 1) {
+        h3_gpu_tensor_free(result);
+        return NULL;
+    }
+    return result;
 }
 
 static h3_gpu_tensor *load_tensor(const h3_weight_store *store, h3_gpu *gpu,
@@ -174,6 +460,9 @@ static h3_gpu_tensor *load_tensor(const h3_weight_store *store, h3_gpu *gpu,
         fail(error, error_size, "weight %s is too large for this process", name);
         return NULL;
     }
+    if (dtype == H3_DTYPE_BF16 && ndim == 2 && find_pair(store->lora, name))
+        return load_adapted(store, gpu, header, tensor, name, shape,
+                            (size_t)elements, error, error_size);
     h3_gpu_tensor *result = dtype == H3_DTYPE_BF16 ?
         h3_gpu_tensor_load_bf16(gpu, header->path, tensor->file_offset,
                                 (size_t)elements) :

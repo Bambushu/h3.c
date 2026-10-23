@@ -1919,6 +1919,7 @@ struct h3_dit_core {
     h3_dit *dit;
     char *weight_directory;
     char *shader_source_path;
+    uint64_t lora_key;
     unsigned active_blocks;
     int visual_condition;
     int audio_condition;
@@ -1957,7 +1958,7 @@ static const char *default_cache_directory(char *buffer, size_t size) {
 }
 
 static void open_cache(h3_dit *dit, const char *weight_directory,
-                       const char *shader_source_path) {
+                       const char *shader_source_path, const h3_lora *lora) {
     char default_directory[1024];
     const char *directory = getenv("H3_DIT_CACHE");
     if (directory && !strcmp(directory, "0")) return;
@@ -1976,6 +1977,7 @@ static void open_cache(h3_dit *dit, const char *weight_directory,
                 "loading without it\n", directory);
         return;
     }
+    if (lora) h3_dit_cache_set_adapter(cache, h3_lora_key(lora));
     const char *verify = getenv("H3_DIT_CACHE_VERIFY");
     cache->verify = verify && *verify && strcmp(verify, "0");
     dit->cache = cache;
@@ -2006,11 +2008,19 @@ static void close_cache(h3_dit *dit) {
 /* Open the weights, the Metal context and H3_DIT_CACHE, and choose the int8
  * paths. long_sequence is sequence >= 128, the int8 QKV/output threshold. */
 static int open_model(h3_dit *dit, const char *weight_directory,
+                      const h3_lora *lora,
                       const char *shader_source_path, int long_sequence,
                       int use_slower_bf16_mlp, int use_slower_bf16_qkv,
                       int use_slower_bf16_attention_output,
                       char *error, size_t error_size) {
-    dit->weights = h3_weight_store_open(weight_directory, error, error_size);
+    /* SSD streaming reads checkpoint bytes straight into its slots. */
+    if (lora && dit->ssd_streaming) {
+        fail(error, error_size, "a LoRA needs resident DiT weights; it cannot "
+             "be combined with SSD streaming");
+        return 0;
+    }
+    dit->weights = h3_weight_store_open_lora(weight_directory, lora,
+                                             error, error_size);
     if (!dit->weights) return 0;
     dit->gpu = h3_gpu_create(shader_source_path, error, error_size);
     if (!dit->gpu) return 0;
@@ -2035,7 +2045,7 @@ static int open_model(h3_dit *dit, const char *weight_directory,
          getenv("H3_BENCH_INT8_MLP_AB") ||
          getenv("H3_INT8_MLP_STAGE"));
     h3_gpu_profile_set_label(dit->gpu, "H3 DiT");
-    open_cache(dit, weight_directory, shader_source_path);
+    open_cache(dit, weight_directory, shader_source_path, lora);
     return 1;
 }
 
@@ -2066,6 +2076,7 @@ static int same_sigmas(const h3_sigma_schedule *left,
 /* Adopt an early-loaded core prepared for exactly this request, or release it
  * so the caller loads serially. Always consumes core. */
 static h3_dit *take_core(h3_dit_core *core, const char *weight_directory,
+                         const h3_lora *lora,
                          const char *shader_source_path,
                          const h3_layout *layout,
                          const h3_sigma_schedule *sigmas,
@@ -2076,6 +2087,7 @@ static h3_dit *take_core(h3_dit_core *core, const char *weight_directory,
     h3_dit *dit = NULL;
     if (core->dit &&
         !strcmp(core->weight_directory, weight_directory) &&
+        core->lora_key == h3_lora_key(lora) &&
         !strcmp(core->shader_source_path, shader_source_path) &&
         core->active_blocks == active_blocks &&
         core->ssd_streaming == ssd_streaming &&
@@ -2098,6 +2110,7 @@ static h3_dit *take_core(h3_dit_core *core, const char *weight_directory,
 
 static h3_dit *load_dit(h3_dit_core *core,
                         const char *weight_directory,
+                        const h3_lora *lora,
                         const char *shader_source_path,
                         const h3_text_embedding *text,
                         const h3_layout *layout,
@@ -2136,7 +2149,7 @@ static h3_dit *load_dit(h3_dit_core *core,
         return NULL;
     }
     double started = stream_now();
-    h3_dit *dit = take_core(core, weight_directory, shader_source_path,
+    h3_dit *dit = take_core(core, weight_directory, lora, shader_source_path,
                             layout, sigmas, active_blocks, ssd_streaming,
                             use_slower_bf16_mlp, use_slower_bf16_qkv,
                             use_slower_bf16_attention_output);
@@ -2166,7 +2179,7 @@ static h3_dit *load_dit(h3_dit_core *core,
     }
     dit->sigmas = *sigmas;
     if (!preloaded &&
-        !open_model(dit, weight_directory, shader_source_path,
+        !open_model(dit, weight_directory, lora, shader_source_path,
                     dit->sequence >= 128, use_slower_bf16_mlp,
                     use_slower_bf16_qkv, use_slower_bf16_attention_output,
                     error, error_size)) goto failed;
@@ -2236,6 +2249,7 @@ failed:
 }
 
 h3_dit_core *h3_dit_core_load(const char *weight_directory,
+                              const h3_lora *lora,
                               const char *shader_source_path,
                               const h3_sigma_schedule *sigmas,
                               unsigned active_blocks,
@@ -2265,6 +2279,7 @@ h3_dit_core *h3_dit_core_load(const char *weight_directory,
         h3_dit_core_free(core);
         return NULL;
     }
+    core->lora_key = h3_lora_key(lora);
     core->active_blocks = active_blocks;
     core->visual_condition = visual_condition != 0;
     core->audio_condition = audio_condition != 0;
@@ -2277,7 +2292,7 @@ h3_dit_core *h3_dit_core_load(const char *weight_directory,
     dit->sigmas = *sigmas;
     /* Every real render has far more than 128 rows; take_core() rejects the
      * core for a request where that prediction is wrong. */
-    if (!open_model(dit, weight_directory, shader_source_path, 1,
+    if (!open_model(dit, weight_directory, lora, shader_source_path, 1,
                     use_slower_bf16_mlp, use_slower_bf16_qkv,
                     use_slower_bf16_attention_output, error, error_size))
         goto failed;
@@ -2311,6 +2326,7 @@ void h3_dit_core_free(h3_dit_core *core) {
 h3_dit *h3_dit_load_with_core(
                          h3_dit_core *core,
                          const char *weight_directory,
+                         const h3_lora *lora,
                          const char *shader_source_path,
                          const h3_text_embedding *text,
                          const h3_layout *layout,
@@ -2337,7 +2353,7 @@ h3_dit *h3_dit_load_with_core(
                          size_t condition_audio_elements,
                          h3_dit_progress progress, void *progress_opaque,
                          char *error, size_t error_size) {
-    return load_dit(core, weight_directory, shader_source_path, text, layout,
+    return load_dit(core, weight_directory, lora, shader_source_path, text, layout,
                     sigmas, active_blocks, core_reuse_interval,
                     token_reduction, ssd_streaming,
                     spatial_rope_scale,
@@ -2357,6 +2373,7 @@ h3_dit *h3_dit_load_with_core(
 }
 
 h3_dit *h3_dit_load_t2va(const char *weight_directory,
+                         const h3_lora *lora,
                          const char *shader_source_path,
                          const h3_text_embedding *text,
                          const h3_layout *layout,
@@ -2379,7 +2396,7 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
                          int use_int8_row_fc2,
                          h3_dit_progress progress, void *progress_opaque,
                          char *error, size_t error_size) {
-    return load_dit(NULL, weight_directory, shader_source_path, text, layout,
+    return load_dit(NULL, weight_directory, lora, shader_source_path, text, layout,
                     sigmas,
                     active_blocks, core_reuse_interval, token_reduction,
                     ssd_streaming,
@@ -2400,6 +2417,7 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
 
 h3_dit *h3_dit_load_conditioned(
                          const char *weight_directory,
+                         const h3_lora *lora,
                          const char *shader_source_path,
                          const h3_text_embedding *text,
                          const h3_layout *layout,
@@ -2426,7 +2444,7 @@ h3_dit *h3_dit_load_conditioned(
                          size_t condition_audio_elements,
                          h3_dit_progress progress, void *progress_opaque,
                          char *error, size_t error_size) {
-    return load_dit(NULL, weight_directory, shader_source_path, text, layout,
+    return load_dit(NULL, weight_directory, lora, shader_source_path, text, layout,
                     sigmas,
                     active_blocks, core_reuse_interval, token_reduction,
                     ssd_streaming,

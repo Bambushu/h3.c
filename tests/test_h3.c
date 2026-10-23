@@ -8,6 +8,7 @@
 #include "h3_video_encoder.h"
 #include "h3_video_vae.h"
 #include "h3_motion_context.h"
+#include "h3_weights.h"
 
 #include <fcntl.h>
 #include <math.h>
@@ -663,6 +664,137 @@ static int exists(const char *path) {
     return access(path, F_OK) == 0;
 }
 
+/* Write a safetensors file of row-major 2-D tensors. */
+typedef struct {
+    const char *name;
+    const char *dtype;
+    unsigned rows, columns;
+    const void *data;
+} test_tensor;
+
+static void write_safetensors(const char *path, const test_tensor *tensors,
+                              unsigned count) {
+    char json[1024];
+    size_t used = (size_t)snprintf(json, sizeof(json), "{");
+    uint64_t offset = 0;
+    for (unsigned index = 0; index < count; index++) {
+        uint64_t bytes = (uint64_t)tensors[index].rows *
+            tensors[index].columns *
+            (strcmp(tensors[index].dtype, "F32") ? 2u : 4u);
+        used += (size_t)snprintf(json + used, sizeof(json) - used,
+            "%s\"%s\":{\"dtype\":\"%s\",\"shape\":[%u,%u],"
+            "\"data_offsets\":[%llu,%llu]}", index ? "," : "",
+            tensors[index].name, tensors[index].dtype, tensors[index].rows,
+            tensors[index].columns, (unsigned long long)offset,
+            (unsigned long long)(offset + bytes));
+        offset += bytes;
+    }
+    used += (size_t)snprintf(json + used, sizeof(json) - used, "}");
+    CHECK(used < sizeof(json));
+    int descriptor = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    CHECK(descriptor >= 0);
+    unsigned char prefix[8];
+    for (unsigned index = 0; index < 8; index++)
+        prefix[index] = (unsigned char)((uint64_t)used >> (8 * index));
+    write_all(descriptor, prefix, sizeof(prefix));
+    write_all(descriptor, json, used);
+    for (unsigned index = 0; index < count; index++)
+        write_all(descriptor, tensors[index].data,
+                  (size_t)tensors[index].rows * tensors[index].columns *
+                  (strcmp(tensors[index].dtype, "F32") ? 2u : 4u));
+    CHECK(close(descriptor) == 0);
+}
+
+static uint16_t bf16_bits(float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    CHECK((bits & 0xFFFFu) == 0);  /* exact BF16 values only */
+    return (uint16_t)(bits >> 16);
+}
+
+static void test_lora(void) {
+    char root[] = "/tmp/h3_lora_XXXXXX";
+    CHECK(mkdtemp(root) != NULL);
+    char checkpoint[256], shard[320], adapter[320], mismatched[320];
+    snprintf(checkpoint, sizeof(checkpoint), "%s/transformer", root);
+    snprintf(shard, sizeof(shard), "%s/model-00001.safetensors", checkpoint);
+    snprintf(adapter, sizeof(adapter), "%s/adapter.safetensors", root);
+    snprintf(mismatched, sizeof(mismatched), "%s/mismatched.safetensors",
+             root);
+    CHECK(mkdir(checkpoint, 0700) == 0);
+
+    /* W [3,4], rank 2: A is F32 [2,4], B is BF16 [3,2]; every product is
+     * exact, so only the final BF16 rounding is under test. */
+    const float w[12] = {1, 1, 1, 1,   1, 1, 1, 1,   2, -1, 0, 0.5f};
+    const float a[8] = {1, 0, 0.5f, 0,   0, 1, 0, 2};
+    const float b[6] = {0x1p-7f, 0,   0x3p-7f, 0x1p-7f,   -0x1p-6f, 0x1p-5f};
+    uint16_t w_bits[12], b_bits[6];
+    for (unsigned index = 0; index < 12; index++) w_bits[index] = bf16_bits(w[index]);
+    for (unsigned index = 0; index < 6; index++) b_bits[index] = bf16_bits(b[index]);
+    const test_tensor checkpoint_tensors[] = {
+        {"blk.weight", "BF16", 3, 4, w_bits},
+        {"blk.bias", "BF16", 1, 4, w_bits},
+    };
+    write_safetensors(shard, checkpoint_tensors, 2);
+    const test_tensor adapter_tensors[] = {
+        {"blk.lora_A.weight", "F32", 2, 4, a},
+        {"blk.lora_B.weight", "BF16", 3, 2, b_bits},
+    };
+    write_safetensors(adapter, adapter_tensors, 2);
+
+    char error[512];
+    CHECK(!h3_lora_open(adapter, 0.0f, error, sizeof(error)));
+    CHECK(!h3_lora_open(shard, 1.0f, error, sizeof(error)));  /* no pairs */
+    h3_lora *lora = h3_lora_open(adapter, 0.5f, error, sizeof(error));
+    CHECK(lora && h3_lora_pairs(lora) == 1);
+    h3_lora *same = h3_lora_open(adapter, 0.5f, error, sizeof(error));
+    h3_lora *stronger = h3_lora_open(adapter, 1.0f, error, sizeof(error));
+    CHECK(same && stronger && h3_lora_key(lora) == h3_lora_key(same));
+    CHECK(h3_lora_key(lora) != h3_lora_key(stronger) && h3_lora_key(lora));
+    CHECK(h3_lora_key(NULL) == 0);
+
+    /* W + 0.5 * B@A, rounded nearest-even: 1 + 2^-8 and 1 + 3*2^-8 are ties
+     * (down to 0x3F80, up to 0x3F82), 1 + 3*2^-9 rounds up. */
+    uint16_t values[12];
+    memcpy(values, w_bits, sizeof(values));
+    CHECK(h3_lora_apply(lora, "blk.bias", values, 3, 4, error,
+                        sizeof(error)) == 0);
+    CHECK(h3_lora_apply(lora, "blk.weight", values, 4, 3, error,
+                        sizeof(error)) == -1);
+    CHECK(h3_lora_apply(lora, "blk.weight", values, 3, 4, error,
+                        sizeof(error)) == 1);
+    const uint16_t expected[12] = {
+        0x3F80, 0x3F80, 0x3F80, 0x3F80,
+        0x3F82, 0x3F80, 0x3F81, 0x3F81,
+        bf16_bits(2.0f - 0x1p-7f), bf16_bits(-1.0f + 0x1p-6f),
+        bf16_bits(-0x1p-8f), bf16_bits(0.5f + 0x1p-5f)};
+    for (unsigned index = 0; index < 12; index++)
+        CHECK(values[index] == expected[index]);
+
+    /* A store checks every target up front. */
+    h3_weight_store *store = h3_weight_store_open_lora(checkpoint, lora,
+                                                       error, sizeof(error));
+    CHECK(store != NULL);
+    h3_weight_store_free(store);
+    const test_tensor wrong_tensors[] = {
+        {"blk.lora_A.weight", "F32", 2, 4, a},
+        {"blk.lora_B.weight", "BF16", 2, 2, b_bits},
+    };
+    write_safetensors(mismatched, wrong_tensors, 2);
+    h3_lora *wrong = h3_lora_open(mismatched, 1.0f, error, sizeof(error));
+    CHECK(wrong != NULL);
+    CHECK(!h3_weight_store_open_lora(checkpoint, wrong, error,
+                                     sizeof(error)));
+    CHECK(strstr(error, "blk.weight") != NULL);
+
+    h3_lora_free(wrong);
+    h3_lora_free(stronger);
+    h3_lora_free(same);
+    h3_lora_free(lora);
+    CHECK(unlink(mismatched) == 0 && unlink(adapter) == 0 &&
+          unlink(shard) == 0 && rmdir(checkpoint) == 0 && rmdir(root) == 0);
+}
+
 static void test_dit_cache(void) {
     char root[] = "/tmp/h3_dit_cache_XXXXXX";
     CHECK(mkdtemp(root) != NULL);
@@ -779,6 +911,27 @@ static void test_dit_cache(void) {
     CHECK(h3_dit_cache_adaln_path(&cache, 20, adaln, adaln_path,
                                   sizeof(adaln_path)));
     CHECK(strstr(adaln_path, "-adaln-s20-") != NULL);
+
+    /* A load-time LoRA keys and renames every file, so base and adapted
+     * caches coexist and pruning one never touches the other; no adapter
+     * leaves the existing keys and names as they were. */
+    other = cache;
+    h3_dit_cache_set_adapter(&other, 0);
+    CHECK(other.source == cache.source &&
+          h3_dit_cache_int8_key(&other, 7, all) == key);
+    h3_dit_cache_set_adapter(&other, UINT64_C(0x1234));
+    CHECK(other.adapter == UINT64_C(0x1234));
+    CHECK(other.source != cache.source);
+    CHECK(h3_dit_cache_int8_key(&other, 7, all) != key);
+    CHECK(h3_dit_cache_adaln_key(&other, &standard, 1, 0) != adaln);
+    h3_dit_cache adapted = cache;
+    h3_dit_cache_set_adapter(&adapted, UINT64_C(0x5678));
+    CHECK(h3_dit_cache_int8_key(&adapted, 7, all) !=
+          h3_dit_cache_int8_key(&other, 7, all));
+    char adapted_path[1200];
+    CHECK(h3_dit_cache_int8_path(&other, 7, key, adapted_path,
+                                 sizeof(adapted_path)));
+    CHECK(strcmp(strrchr(adapted_path, '/'), strrchr(path, '/')) != 0);
 
     /* Layout: page-aligned payloads and file end. */
     const uint64_t sizes[3] = {100, 20000, 7};
@@ -1233,6 +1386,7 @@ int main(void) {
     test_layout_hybrid();
     test_safetensors();
     test_dit_cache();
+    test_lora();
     test_rng_and_solver();
     test_rgb_resize();
     test_dit_row_conversions();

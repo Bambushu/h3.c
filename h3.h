@@ -166,13 +166,19 @@ typedef struct {
     const char *motion_context;
     /* Write this generation's final latents for a later motion_context. */
     const char *save_context;
+    /* Optional LoRA applied to the DiT weights as they load, W + scale*B@A
+     * (e.g. the Turbo step-distillation adapter, sampled at 5-6 steps), so
+     * one BF16 checkpoint serves a base and an adapted lane. Its int8 cache
+     * is built once beside the base one. Not with ssd_streaming. */
+    const char *lora_path;
+    double lora_scale;
 } h3_params;
 
 #define H3_PARAMS_DEFAULT { \
     H3_DEFAULT_WIDTH, H3_DEFAULT_HEIGHT, H3_DEFAULT_FRAMES, H3_DEFAULT_STEPS, \
     UINT64_C(42), NULL, NULL, NULL, NULL, 0, H3_REFERENCE_IMAGE_MATCH, \
     1, H3_DEFAULT_DIT_LAYERS, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NULL, NULL, NULL, \
-    H3_SAMPLER_EULER, H3_SCHEDULER_LINEAR, 0.0, NULL, NULL \
+    H3_SAMPLER_EULER, H3_SCHEDULER_LINEAR, 0.0, NULL, NULL, NULL, 1.0 \
 }
 
 typedef struct {

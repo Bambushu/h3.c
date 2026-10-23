@@ -121,11 +121,19 @@ int h3_dit_cache_init(h3_dit_cache *cache, const char *directory,
     return 1;
 }
 
+void h3_dit_cache_set_adapter(h3_dit_cache *cache, uint64_t adapter) {
+    if (!adapter) return;
+    cache->adapter = adapter;
+    cache->source = hash_u64(cache->source, adapter);
+}
+
 static uint64_t base_key(const h3_dit_cache *cache, h3_dit_cache_kind kind) {
     uint64_t key = hash_u64(HASH_SEED, H3_DIT_CACHE_VERSION);
     key = hash_u64(key, (uint64_t)kind);
     key = hash_u64(key, cache->checkpoint);
-    return hash_u64(key, cache->variant);
+    key = hash_u64(key, cache->variant);
+    /* Unadapted keys stay as before, so existing caches remain valid. */
+    return cache->adapter ? hash_u64(key, cache->adapter) : key;
 }
 
 uint64_t h3_dit_cache_int8_key(const h3_dit_cache *cache, unsigned block,
