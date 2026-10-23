@@ -28,6 +28,7 @@ default: `docs/bench-2026-10-21.md`.
 | GPU queue depth | upstream default | | `H3_GPU_QUEUE_DEPTH=<n>` |
 | Early DiT load | off | not in upstream | `H3_DIT_EARLY_LOAD=1` (DiT coexists with the encoders; needs the memory) |
 | Sol-Attn block-sparse attention | off | not in upstream | below |
+| DiT LoRA at load | off | not in upstream | `--lora PATH [--lora-scale S]` (library: `lora_path`/`lora_scale`): W + S*B@A on every adapter target before int8 quantization, byte-identical to `tools/fold_turbo_lora.py`; its own 18 GiB int8 cache beside the base one, keyed and named by the adapter's content hash and scale (cold build 102 s, mapped 6.9 s). The Turbo adapter at `--steps 6` is the speed lane on the base checkpoint. Not with `--ssd-streaming` (2026-10-23) |
 
 Defaults the same as upstream and left alone: `--steps 20`, `--reuse 1`,
 `--layers 50`, `--core-reuse 1`, `--seed 42`, 864x480, 56 frames.
