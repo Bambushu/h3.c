@@ -29,6 +29,7 @@ struct h3_ctx {
     int conditioning_present;
     char *dit_key;
     struct h3_dit *dit;
+    struct h3_lora *lora;   /* the adapter ctx->dit was loaded with */
     char *video_decoder_key;
     struct h3_video_vae_decoder *video_decoder;
 };

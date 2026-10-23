@@ -9,10 +9,36 @@
 
 typedef struct h3_weight_store h3_weight_store;
 
+/* A low-rank adapter applied to BF16 weights as they load, so one checkpoint
+ * serves both the base model and an adapted one (the Turbo step-distillation
+ * LoRA): W' = W + scale * (B @ A), computed in F32 with one Accelerate SGEMM
+ * per tensor and rounded to BF16 nearest-even, the same path as
+ * tools/fold_turbo_lora.py. Tensors are named <target>.lora_A.weight [rank,
+ * in] and <target>.lora_B.weight [out, rank] over the checkpoint's key space,
+ * BF16 or F32. Read-only after open; one adapter may serve several stores. */
+typedef struct h3_lora h3_lora;
+
+h3_lora *h3_lora_open(const char *path, float scale,
+                      char *error, size_t error_size);
+void h3_lora_free(h3_lora *lora);
+size_t h3_lora_pairs(const h3_lora *lora);
+/* Hash of the adapter file's bytes and the scale, for derived-weight caches. */
+uint64_t h3_lora_key(const h3_lora *lora);
+/* Add the adapter's delta to a row-major BF16 [rows, columns] weight in
+ * place. Returns 1 if name is a target, 0 if not, -1 on error. */
+int h3_lora_apply(const h3_lora *lora, const char *name, uint16_t *values,
+                  uint64_t rows, uint64_t columns,
+                  char *error, size_t error_size);
+
 /* Open every safetensors header in a component directory without reading
  * tensor payloads. */
 h3_weight_store *h3_weight_store_open(const char *directory,
                                       char *error, size_t error_size);
+/* As above, with every BF16 load of an adapter target adapted. Fails unless
+ * each target is a BF16 matrix of this store with the adapter's shape. */
+h3_weight_store *h3_weight_store_open_lora(const char *directory,
+                                           const h3_lora *lora,
+                                           char *error, size_t error_size);
 void h3_weight_store_free(h3_weight_store *store);
 size_t h3_weight_store_shards(const h3_weight_store *store);
 

@@ -44,6 +44,7 @@ typedef struct {
     uint64_t source;      /* resolved checkpoint directory; names the files */
     uint64_t checkpoint;  /* shard names, sizes and modification times */
     uint64_t variant;     /* device, OS build, shader source, quantizer env */
+    uint64_t adapter;     /* h3_lora_key of a load-time LoRA, 0 for none */
     int verify;           /* H3_DIT_CACHE_VERIFY */
     int write_failed;     /* stop rewriting after the first failure */
     /* H3_PROFILE counters for one load. */
@@ -73,6 +74,11 @@ int h3_dit_cache_init(h3_dit_cache *cache, const char *directory,
                       const char *weight_directory,
                       const char *gpu_description,
                       const char *shader_source_path);
+
+/* Key every file on a LoRA applied at load (h3_lora_key). It also renames the
+ * files, so base and adapted caches of one checkpoint coexist and pruning one
+ * never removes the other. Call right after h3_dit_cache_init. */
+void h3_dit_cache_set_adapter(h3_dit_cache *cache, uint64_t adapter);
 
 /* matrices is a bit mask of the int8 matrices stored for this block. Keys are
  * per block, so every active-layer selection shares the same files. */

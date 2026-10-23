@@ -89,7 +89,7 @@ int main(int argc, char **argv) {
     if (!h3_schedule_build(20, &sigmas)) die("cannot build sampler schedule");
     char weights[1024];
     snprintf(weights, sizeof(weights), "%s/FL2VA/transformer", model_root);
-    h3_dit *dit = h3_dit_load_t2va(weights, "h3_shaders.metal", &text,
+    h3_dit *dit = h3_dit_load_t2va(weights, NULL, "h3_shaders.metal", &text,
                                     &layout, &sigmas, 50, 1, 0, 0, 1.0f, 0, 1, 1, 1,
                                     1, 1, 1, 1, 0, 0, 0,
                                     progress, NULL,

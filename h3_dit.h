@@ -4,6 +4,7 @@
 #include "h3_gpu.h"
 #include "h3_host.h"
 #include "h3_text_encoder.h"
+#include "h3_weights.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -18,9 +19,13 @@ typedef int (*h3_dit_preview)(int completed_steps, int total_steps,
                               size_t video_elements, void *opaque);
 
 /* Load a text-only FL2VA transformer. Text refinement and AdaLN precomputation
- * happen before the persistent core is loaded. SSD streaming retains only the
+ * happen before the persistent core is loaded. lora (NULL for none) adapts
+ * the BF16 weights as they load and keys the int8/AdaLN cache files; it must
+ * outlive the load and cannot be combined with SSD streaming, which retains
+ * only the
  * small block norms and two alternating BF16 matrix slots. */
 h3_dit *h3_dit_load_t2va(const char *weight_directory,
+                         const h3_lora *lora,
                          const char *shader_source_path,
                          const h3_text_embedding *text,
                          const h3_layout *layout,
@@ -49,6 +54,7 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
  * counts must exactly match layout.img_cond_rows/audio_cond_rows. */
 h3_dit *h3_dit_load_conditioned(
                          const char *weight_directory,
+                         const h3_lora *lora,
                          const char *shader_source_path,
                          const h3_text_embedding *text,
                          const h3_layout *layout,
@@ -84,6 +90,7 @@ void h3_dit_free(h3_dit *dit);
  * packed layout will carry visual/audio condition rows. */
 typedef struct h3_dit_core h3_dit_core;
 h3_dit_core *h3_dit_core_load(const char *weight_directory,
+                              const h3_lora *lora,
                               const char *shader_source_path,
                               const h3_sigma_schedule *sigmas,
                               unsigned active_blocks,
@@ -103,6 +110,7 @@ void h3_dit_core_free(h3_dit_core *core);
 h3_dit *h3_dit_load_with_core(
                          h3_dit_core *core,
                          const char *weight_directory,
+                         const h3_lora *lora,
                          const char *shader_source_path,
                          const h3_text_embedding *text,
                          const h3_layout *layout,

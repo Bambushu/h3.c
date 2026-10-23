@@ -37,6 +37,8 @@ static void usage(const char *program) {
         "      --core-reuse N     Core refresh: 1 exact (default), 4 fast, 6 aggressive\n"
         "      --token-reduction  Pair video tokens in middle DiT blocks\n"
         "      --ssd-streaming    Stream original BF16 DiT layers from SSD\n"
+        "      --lora PATH        Apply a DiT LoRA at load, e.g. the Turbo adapter (5-6 steps)\n"
+        "      --lora-scale F     LoRA strength (default 1)\n"
         "      --use-int8-row-fc2 Faster one-scale int8 FC2 (M5)\n"
         "      --use-reference-rope  Disable native 256 RoPE adaptation\n"
         "      --use-slower-bf16-mlp  Force close-reference BF16/MPS MLP\n"
@@ -295,6 +297,7 @@ int main(int argc, char **argv) {
            OPT_USE_SLOWER_GROUPED_QUANTIZER,
            OPT_SEED,
            OPT_FIRST, OPT_LAST, OPT_MOTION_CONTEXT, OPT_SAVE_CONTEXT,
+           OPT_LORA, OPT_LORA_SCALE,
            OPT_REF_IMAGE, OPT_REF_IMAGE_SIZE,
            OPT_REF_VIDEO, OPT_REF_SILENT_VIDEO, OPT_REF_VIDEO_AUDIO,
            OPT_REF_AUDIO, OPT_FRAMES_DIR, OPT_SHOW, OPT_ZOOM,
@@ -319,6 +322,8 @@ int main(int argc, char **argv) {
         {"core-reuse", required_argument, NULL, OPT_CORE_REUSE},
         {"token-reduction", no_argument, NULL, OPT_TOKEN_REDUCTION},
         {"ssd-streaming", no_argument, NULL, OPT_SSD_STREAMING},
+        {"lora", required_argument, NULL, OPT_LORA},
+        {"lora-scale", required_argument, NULL, OPT_LORA_SCALE},
         {"sdpa-query-block", required_argument, NULL, OPT_SDPA_QUERY_BLOCK},
         {"use-int8-row-fc2", no_argument, NULL, OPT_USE_INT8_ROW_FC2},
         {"use-reference-rope", no_argument, NULL, OPT_USE_REFERENCE_ROPE},
@@ -418,6 +423,18 @@ int main(int argc, char **argv) {
                 break;
             case OPT_TOKEN_REDUCTION: params.token_reduction = 1; break;
             case OPT_SSD_STREAMING: params.ssd_streaming = 1; break;
+            case OPT_LORA: params.lora_path = optarg; break;
+            case OPT_LORA_SCALE: {
+                char *end = NULL;
+                errno = 0;
+                params.lora_scale = strtod(optarg, &end);
+                if (errno || !end || end == optarg || *end ||
+                    !isfinite(params.lora_scale) || params.lora_scale == 0.0) {
+                    fprintf(stderr, "h3: invalid lora scale: %s\n", optarg);
+                    return 2;
+                }
+                break;
+            }
             case OPT_SDPA_QUERY_BLOCK: {
                 /* Sets H3_SDPA_MAX_QUERY_ROWS for the Ultra SDPA workaround (#16). */
                 int rows = parse_int(optarg, "sdpa query block");
