@@ -1220,22 +1220,27 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             layout_references[index].audio_t = latent.length;
             presentations[index].has_audio = 1;
             if (params->lock_audio && !audio_lock) {
-                if (latent.length != temporal.audio_t) {
-                    h3_set_error(ctx, "--lock-audio: the clip encodes to %d "
-                                 "audio latents, the take needs %d (%.3f s)",
+                if (latent.length < temporal.audio_t) {
+                    h3_set_error(ctx, "--lock-audio: the clip covers %d audio "
+                                 "latents, the take needs %d (%.3f s)",
                                  latent.length, temporal.audio_t,
                                  (double)temporal.audio_t / H3_AUDIO_LATENT_FPS);
                     h3_audio_latent_free(&latent);
                     goto cleanup;
                 }
-                /* the encoder's [32,2,T] order is the target audio order */
-                audio_lock = malloc(elements * sizeof(*audio_lock));
+                /* the encoder's [32,2,T] order is the target audio order; a
+                   longer clip is cut to the take */
+                size_t keep = (size_t)64 * (size_t)temporal.audio_t;
+                audio_lock = malloc(keep * sizeof(*audio_lock));
                 if (!audio_lock) {
                     h3_audio_latent_free(&latent);
                     h3_set_error(ctx, "out of memory keeping the locked audio");
                     goto cleanup;
                 }
-                memcpy(audio_lock, latent.values, elements * sizeof(*audio_lock));
+                for (size_t row = 0; row < 64; row++)
+                    memcpy(audio_lock + row * (size_t)temporal.audio_t,
+                           latent.values + row * (size_t)latent.length,
+                           (size_t)temporal.audio_t * sizeof(*audio_lock));
             }
             h3_audio_latent_free(&latent);
             if (progress.cancelled) goto cleanup;
@@ -1599,6 +1604,10 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         if (!audio_lock) {
             h3_set_error(ctx, "--lock-audio needs a --ref-audio clip encoded "
                               "in this run");
+            goto cleanup;
+        }
+        if (audio_count != (size_t)64 * (size_t)temporal.audio_t) {
+            h3_set_error(ctx, "--lock-audio: target audio geometry mismatch");
             goto cleanup;
         }
         memcpy(audio, audio_lock, audio_count * sizeof(*audio));

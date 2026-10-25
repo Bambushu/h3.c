@@ -55,7 +55,7 @@ static void usage(const char *program) {
         "      --ref-video-audio VIDEO AUDIO  Append video + soundtrack\n"
         "      --ref-audio PATH    Append an ordered standalone audio clip\n"
         "      --lock-audio        Use the first --ref-audio clip as the exact\n"
-        "                          soundtrack (lip sync); it must span the take\n"
+        "                          soundtrack (lip sync); a longer clip is cut\n"
         "      --frames-dir PATH  Write generated frames as PPM files\n"
         "      --show             Display a frame after every denoising step (M5)\n"
         "      --zoom N           Terminal image zoom (default: 2 for Retina)\n"
