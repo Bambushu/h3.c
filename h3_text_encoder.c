@@ -216,36 +216,8 @@ static int read_weight_bf16(const h3_weight_store *store, const char *name,
                             int ndim, const uint64_t *shape,
                             h3_gpu_tensor *destination,
                             char *error, size_t error_size) {
-    const h3_st_header *header = NULL;
-    const h3_st_tensor *tensor = h3_weight_find(store, name, &header);
-    if (!tensor) {
-        fail(error, error_size, "required weight is absent: %s", name);
-        return 0;
-    }
-    if (tensor->dtype != H3_DTYPE_BF16 || tensor->ndim != ndim) {
-        fail(error, error_size,
-             "weight %s has dtype/rank %s/%d, expected BF16/%d", name,
-             h3_dtype_name(tensor->dtype), tensor->ndim, ndim);
-        return 0;
-    }
-    uint64_t elements = 1;
-    for (int dimension = 0; dimension < ndim; dimension++) {
-        if (tensor->shape[dimension] != shape[dimension]) {
-            fail(error, error_size,
-                 "weight %s shape mismatch at dimension %d", name,
-                 dimension);
-            return 0;
-        }
-        if (shape[dimension] && elements > UINT64_MAX / shape[dimension]) {
-            fail(error, error_size, "weight %s shape overflows", name);
-            return 0;
-        }
-        elements *= shape[dimension];
-    }
-    if (elements > SIZE_MAX ||
-        !h3_gpu_tensor_read_file_bf16(destination, header->path,
-                                      tensor->file_offset, (size_t)elements,
-                                      error, error_size)) {
+    if (!h3_weight_read_bf16(store, name, ndim, shape, destination, error,
+                             error_size)) {
         if (error && error_size && !error[0])
             fail(error, error_size, "cannot prefetch %s", name);
         return 0;

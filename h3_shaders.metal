@@ -4173,6 +4173,16 @@ kernel void h3_gqa_causal_bf16(
     }
 }
 
+/* int8 checkpoint: expand a streamed per-row int8 weight back to BF16. */
+kernel void h3_dequantize_int8_rows_bf16(device const char *input [[buffer(0)]],
+                                         device const float *scales [[buffer(1)]],
+                                         device ushort *output [[buffer(2)]],
+                                         constant uint2 &shape [[buffer(3)]],
+                                         uint gid [[thread_position_in_grid]]) {
+    if (gid >= shape.x * shape.y) return;
+    output[gid] = h3_f32_to_bf16((float)input[gid] * scales[gid / shape.y]);
+}
+
 kernel void h3_add_bf16(device const ushort *left [[buffer(0)]],
                          device const ushort *right [[buffer(1)]],
                          device ushort *output [[buffer(2)]],

@@ -9,7 +9,7 @@ default: `docs/bench-2026-10-21.md`.
 
 | Setting | This build | Upstream | Override |
 | --- | --- | --- | --- |
-| DiT weights | resident int8 (no `--ssd-streaming`) with the quantized cache at `~/Library/Caches/h3c/dit` (18 GiB, cached load 7 s vs 106 s) | same weights, cache opt-in | `H3_DIT_CACHE=0` disables, `H3_DIT_CACHE=<dir>` relocates, `H3_DIT_CACHE_VERIFY=1` checks it; `--ssd-streaming` for small-memory Macs |
+| DiT weights | resident int8 (no `--ssd-streaming`) with the quantized cache at `~/Library/Caches/h3c/dit` (18 GiB, cached load 7 s vs 106 s) | same weights, cache opt-in | `H3_DIT_CACHE=0` disables, `H3_DIT_CACHE=<dir>` relocates, `H3_DIT_CACHE_VERIFY=1` checks it; `--ssd-streaming` for small-memory Macs, or `-d` an int8 copy from `h3_int8_pack` (73 GiB, streams half the bytes) |
 | Video VAE precision | bf16 (63 dB against F32, 3 to 4x faster decode) | f32 | `H3_VAE_PRECISION=f32` or `int8`; `H3_VAE_F32_ATTENTION=1` keeps attention in F32 |
 | VAE decoder prefetch | on (decoder loads during the denoise; bit-identical) | not in upstream | `H3_VAE_PREFETCH=0` |
 | VAE weight cache | off | not in upstream | `H3_VAE_CACHE=<dir>` (4.8 GiB, bit-identical) |

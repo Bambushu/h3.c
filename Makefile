@@ -38,6 +38,10 @@ vae_bench: tools/vae_bench.o $(LIB_OBJ)
 h3_vae_encoder_bench: tools/vae_encoder_ab.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
+# H3_SSD_INT8: pack the FL2VA DiT into per-block int8 files for --ssd-streaming.
+h3_int8_pack: tools/h3_int8_pack.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
 tools/%.o: tools/%.c
 	$(CC) $(CFLAGS) -I. -c $< -o $@
 
@@ -230,7 +234,7 @@ clean:
 		h3_real_dit_schedule_test h3_real_dit_test h3_semantic_dit_test \
 		h3_real_video_vae_test h3_semantic_vae_test \
 	h3_dit_bench h3_dit_bench_864 vae_bench h3_vae_encoder_bench \
-	libh3.a *.o *.d tests/*.o tests/*.d tools/*.o tools/*.d
+	libh3.a h3_int8_pack *.o *.d tests/*.o tests/*.d tools/*.o tools/*.d
 
 mc_probe: tools/mc_probe.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)

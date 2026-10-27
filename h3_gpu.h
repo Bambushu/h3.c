@@ -82,6 +82,11 @@ int h3_gpu_tensor_read_file_bf16(h3_gpu_tensor *tensor, const char *path,
 int h3_gpu_tensor_stream_file_bf16(h3_gpu_tensor *tensor, const char *path,
                                    uint64_t file_offset, size_t elements,
                                    char *error, size_t error_size);
+/* As h3_gpu_tensor_stream_file_bf16, for a tensor of any dtype: reads exactly
+ * the tensor's elements. Used for int8 checkpoint weights and scales. */
+int h3_gpu_tensor_stream_file(h3_gpu_tensor *tensor, const char *path,
+                              uint64_t file_offset, char *error,
+                              size_t error_size);
 void h3_gpu_tensor_free(h3_gpu_tensor *tensor);
 size_t h3_gpu_tensor_elements(const h3_gpu_tensor *tensor);
 h3_gpu_dtype h3_gpu_tensor_dtype(const h3_gpu_tensor *tensor);
@@ -390,6 +395,12 @@ int h3_gpu_mlp_nax_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                         uint32_t output_dim);
 /* Experimental M5 Metal 4 int8 MLP. Weights use one F32 scale per output
  * channel; activations are quantized dynamically with one F32 scale per row. */
+/* Expand per-row int8 weights to BF16: output = input * scales[row]. Plain
+ * Metal, no TensorOps, so it runs on every Apple GPU. */
+int h3_gpu_dequantize_weight_int8(h3_gpu *gpu, h3_gpu_tensor *output,
+                                  const h3_gpu_tensor *input,
+                                  const h3_gpu_tensor *scales, uint32_t rows,
+                                  uint32_t columns);
 int h3_gpu_quantize_weight_int8(h3_gpu *gpu, h3_gpu_tensor *output,
                                 h3_gpu_tensor *scales,
                                 const h3_gpu_tensor *input, uint32_t rows,

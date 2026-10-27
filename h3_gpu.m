@@ -724,21 +724,24 @@ h3_gpu_tensor *h3_gpu_tensor_load_cache(h3_gpu *opaque, const char *path,
                                    item_size, dtype, "cache", 1);
 }
 
-static int h3_gpu_tensor_read_file_bf16_mode(
+static int h3_gpu_tensor_read_file_mode(
                                  h3_gpu_tensor *opaque, const char *path,
                                  uint64_t file_offset, size_t elements,
-                                 int uncached,
+                                 h3_gpu_dtype dtype, int uncached,
                                  char *error, size_t error_size) {
     if (error && error_size) error[0] = '\0';
+    size_t element_bytes = dtype == H3_GPU_I8 ? 1 :
+                           dtype == H3_GPU_BF16 ? sizeof(uint16_t) :
+                                                  sizeof(float);
     if (!opaque || !path || !*path ||
-        TENSOR(opaque).dtype != H3_GPU_BF16 ||
+        TENSOR(opaque).dtype != dtype ||
         elements != TENSOR(opaque).elements ||
-        elements > SIZE_MAX / sizeof(uint16_t) || file_offset > INT64_MAX) {
+        elements > SIZE_MAX / element_bytes || file_offset > INT64_MAX) {
         if (error && error_size)
-            snprintf(error, error_size, "invalid BF16 file read request");
+            snprintf(error, error_size, "invalid tensor file read request");
         return 0;
     }
-    size_t bytes = elements * sizeof(uint16_t);
+    size_t bytes = elements * element_bytes;
     if ((uint64_t)bytes > (uint64_t)INT64_MAX - file_offset) {
         if (error && error_size)
             snprintf(error, error_size, "BF16 file read range overflows");
@@ -782,15 +785,30 @@ static int h3_gpu_tensor_read_file_bf16_mode(
 int h3_gpu_tensor_read_file_bf16(h3_gpu_tensor *opaque, const char *path,
                                  uint64_t file_offset, size_t elements,
                                  char *error, size_t error_size) {
-    return h3_gpu_tensor_read_file_bf16_mode(
-        opaque, path, file_offset, elements, 0, error, error_size);
+    return h3_gpu_tensor_read_file_mode(
+        opaque, path, file_offset, elements, H3_GPU_BF16, 0, error,
+        error_size);
 }
 
 int h3_gpu_tensor_stream_file_bf16(h3_gpu_tensor *opaque, const char *path,
                                    uint64_t file_offset, size_t elements,
                                    char *error, size_t error_size) {
-    return h3_gpu_tensor_read_file_bf16_mode(
-        opaque, path, file_offset, elements, 1, error, error_size);
+    return h3_gpu_tensor_read_file_mode(
+        opaque, path, file_offset, elements, H3_GPU_BF16, 1, error,
+        error_size);
+}
+
+int h3_gpu_tensor_stream_file(h3_gpu_tensor *opaque, const char *path,
+                              uint64_t file_offset, char *error,
+                              size_t error_size) {
+    if (!opaque) {
+        if (error && error_size)
+            snprintf(error, error_size, "invalid tensor file read request");
+        return 0;
+    }
+    return h3_gpu_tensor_read_file_mode(
+        opaque, path, file_offset, TENSOR(opaque).elements,
+        TENSOR(opaque).dtype, 1, error, error_size);
 }
 
 void h3_gpu_tensor_free(h3_gpu_tensor *tensor) {
@@ -3317,6 +3335,29 @@ static int h3_gpu_quantize_bf16_int8_groups(
     stats.direct_dispatches++;
     gpu.stats = stats;
     return 1;
+}
+
+int h3_gpu_dequantize_weight_int8(h3_gpu *opaque, h3_gpu_tensor *output,
+                                  const h3_gpu_tensor *input,
+                                  const h3_gpu_tensor *scales, uint32_t rows,
+                                  uint32_t columns) {
+    H3GPU *gpu = GPU(opaque);
+    if (!rows || !columns || rows > UINT32_MAX / columns ||
+        !h3_gpu_require_i8(gpu, input, (size_t)rows * columns,
+                           @"int8 weight to expand") ||
+        !h3_gpu_require_f32(gpu, scales, rows, @"int8 weight scales") ||
+        !h3_gpu_require_bf16(gpu, output, (size_t)rows * columns,
+                             @"expanded BF16 weight")) return 0;
+    uint32_t shape_rows = rows, shape_columns = columns;
+    return h3_gpu_dispatch_1d(gpu, @"h3_dequantize_int8_rows_bf16",
+                              rows * columns,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(scales).buffer offset:0 atIndex:1];
+            [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:2];
+            uint32_t shape[2] = {shape_rows, shape_columns};
+            [encoder setBytes:shape length:sizeof(shape) atIndex:3];
+        });
 }
 
 int h3_gpu_quantize_weight_int8(h3_gpu *opaque, h3_gpu_tensor *output,

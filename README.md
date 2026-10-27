@@ -90,6 +90,62 @@ machines where that does not fit.
 | H.264 `-preset slow` | [#70](https://github.com/antirez/h3.c/issues/70) | The fast preset added its own blocking on top of the decoded frames. CRF stays 18 |
 | `--motion-context` / `--save-context`: chain clips on the previous take's latent tail | after [ComfyUI-H3-Motion-Context](https://github.com/NikoDemon80/ComfyUI-H3-Motion-Context) | A reference video of the previous clip restages the shot (measured: a jump cut, and twice the rows). Pinning the last 22 frames and 0.9 s of sound at the head of the next generation continues it, with the same `--ref-image` identity references alongside; see below |
 | Sol-Attn block-sparse attention, opt-in | [AlexanderIstomin/h3.c](https://github.com/AlexanderIstomin/h3.c) `perf/h3-sol-attn-metal`, compiler fixes from [fzeng656/h3.c](https://github.com/fzeng656/h3.c); kernel by [yshenaw](https://github.com/yshenaw/ComfyUI-SolAttn-MPS) | Attention is the bulk of the denoise at production shapes and no dense kernel beats MPSGraph there. See below |
+| int8 checkpoint, opt-in (`h3_int8_pack`) | this fork | A 73 GiB copy of the 144 GiB snapshot: DiT and Qwen projections stored as per-row int8 and expanded to BF16 as they are read, so a 16 GB Mac can keep the model on its internal SSD. `--ssd-streaming` then reads half the bytes. Runs on every Apple GPU. See below |
+
+### int8 checkpoint: the model in 73 GiB
+
+`h3_int8_pack` writes a copy of the snapshot with the same folder layout, in
+which the large 2D BF16 weights are stored as I8 with one F32 scale per row
+(`<name>_int8_scale`): the DiT blocks' QKV, attention-output, FC1, FC2 and
+AdaLN projections and the Qwen layers' projections. `lm_head` is dropped (h3
+does not use it); everything else is copied. Point `-d` at the copy:
+
+```sh
+make h3_int8_pack
+./h3_int8_pack ./MiniMax-H3 ~/h3-int8/MiniMax-H3
+./h3 -d ~/h3-int8/MiniMax-H3 --ssd-streaming ...
+```
+
+h3 expands I8 to BF16 as it reads a weight (value = q * scale, rounded to
+nearest even): on the CPU for normal loads and the Qwen prefetch, on the GPU
+for `--ssd-streaming`, where each block's int8 bytes go into the stream slot
+and a plain Metal kernel fills the same BF16 buffers. Every kernel after that
+is unchanged, and no TensorOps are needed: it runs on M1. Rows are quantized
+like `h3_quantize_bf16_int8_rows_scalar` (`max|w| / 127`, round to nearest).
+
+| Component | Snapshot | int8 copy |
+| --- | --- | --- |
+| DiT block matrices | 37.3 GiB | 18.7 GiB |
+| DiT AdaLN projections | 24.2 GiB | 12.1 GiB |
+| Qwen text encoder | 62.1 GiB | ~31 GiB |
+| Video and audio VAE | 10.3 GiB | 10.3 GiB (copied) |
+
+Measured 2026-10-27 on an M1 MacBook Air 16 GB, 512x512, 22 frames, 4
+steps, `--reuse 1`, seed 42, `--ssd-streaming`. The first two columns read
+the model from a 10 Gb/s USB SSD (0.66 GiB/s), the last from the int8 copy on
+the internal SSD:
+
+| | BF16, USB SSD | int8 DiT only, USB SSD | int8 copy, internal SSD |
+| --- | --- | --- | --- |
+| Qwen text encoder | 58.9 s | 59.0 s | 16.9 s |
+| DiT load | 44.2 s | 41.7 s | 14.1 s |
+| DiT bytes read | 144.3 GiB | 72.2 GiB | 72.2 GiB (2.29 GiB/s) |
+| Unhidden read wait | 5.3 s | 0.004 s | 0.004 s |
+| Euler denoise | 322.5 s | 341.0 s | 369.4 s |
+| Total | 522 s | 555 s | 520 s |
+| Peak system memory | 12.9 GB | 12.9 GB | 13.2 GB |
+| Against BF16 | | PSNR 27.0 dB, SSIM 0.90 | PSNR 27.2 dB, SSIM 0.90 |
+
+Every int8 run keeps the subject and motion; framing shifts slightly. The
+int8 text encoder and AdaLN add little on top of the int8 DiT (33.1 dB
+between the last two columns).
+
+The M1's denoise is not faster with it: its GPU is the bottleneck and the
+BF16 reads were already hidden, so the expand kernel adds 20 to 45 s. What
+int8 buys there is space, and with the copy on the internal SSD the text
+encoder and DiT load drop from about 100 s to 31 s. Speed should follow where the read is the longer side: a GPU
+about twice the M1 or faster on the same drive, slower drives, or 32 GB+
+Macs where the int8 DiT stays in the file cache (not yet measured).
 
 ### Motion context: continuing a take
 

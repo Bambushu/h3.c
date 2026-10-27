@@ -63,6 +63,12 @@ typedef struct {
     uint64_t file_offset;
     size_t elements;
     unsigned field;
+    /* int8 checkpoint (tools/h3_int8_pack): I8 rows plus F32 row scales. */
+    int int8;
+    uint32_t rows;
+    uint32_t columns;
+    const char *scale_path;
+    uint64_t scale_offset;
 } h3_dit_stream_source;
 
 typedef struct {
@@ -90,6 +96,8 @@ struct h3_dit {
     int use_slower_grouped_quantizer;
     int use_int8_row_fc2;
     int ssd_streaming;
+    int int8_stream;  /* the streamed matrices are I8 in the checkpoint */
+    int stream_dtype_known;
     int keep_bf16_mlp;
     int activation_aliases;
     int fused_patch_projection;
@@ -604,7 +612,9 @@ static int prepare_stream_source(h3_dit *dit,
              name);
         return 0;
     }
-    if (!header || tensor->dtype != H3_DTYPE_BF16 || tensor->ndim != 2 ||
+    int int8 = tensor->dtype == H3_DTYPE_I8;
+    if (!header || (tensor->dtype != H3_DTYPE_BF16 && !int8) ||
+        tensor->ndim != 2 ||
         tensor->shape[0] != rows || tensor->shape[1] != columns ||
         rows > SIZE_MAX / columns) {
         fail(error, error_size, "streaming weight has the wrong schema: %s",
@@ -615,6 +625,17 @@ static int prepare_stream_source(h3_dit *dit,
     source->file_offset = tensor->file_offset;
     source->elements = (size_t)(rows * columns);
     source->field = field;
+    source->int8 = int8;
+    source->rows = (uint32_t)rows;
+    source->columns = (uint32_t)columns;
+    if (int8) {
+        const h3_st_header *scale_header = NULL;
+        const h3_st_tensor *scales = NULL;
+        if (!h3_weight_int8_scales(dit->weights, name, rows, &scale_header,
+                                   &scales, error, error_size)) return 0;
+        source->scale_path = scale_header->path;
+        source->scale_offset = scales->file_offset;
+    }
     return 1;
 }
 
@@ -635,6 +656,17 @@ static int prepare_stream_layer(h3_dit *dit, unsigned layer,
 #undef SOURCE
     qsort(stream->sources, STREAM_MATRICES, sizeof(stream->sources[0]),
           compare_stream_sources);
+    for (unsigned index = 0; index < STREAM_MATRICES; index++) {
+        int int8 = stream->sources[index].int8;
+        if (!dit->stream_dtype_known) {
+            dit->int8_stream = int8;
+            dit->stream_dtype_known = 1;
+        } else if (int8 != dit->int8_stream) {
+            fail(error, error_size,
+                 "DiT block %u mixes int8 and BF16 streamed weights", layer);
+            return 0;
+        }
+    }
     return 1;
 }
 
@@ -653,6 +685,22 @@ static int allocate_stream_slot(h3_dit *dit, h3_dit_block *slot,
              h3_gpu_error(dit->gpu));
         return 0;
     }
+    if (!dit->int8_stream) return 1;
+    slot->qkv_int8 = h3_gpu_tensor_new_i8(dit->gpu, (size_t)INNER * 3 * HIDDEN);
+    slot->qkv_scales = h3_gpu_tensor_new_f32(dit->gpu, INNER * 3);
+    slot->out_int8 = h3_gpu_tensor_new_i8(dit->gpu, (size_t)HIDDEN * INNER);
+    slot->out_scales = h3_gpu_tensor_new_f32(dit->gpu, HIDDEN);
+    slot->fc1_int8 = h3_gpu_tensor_new_i8(dit->gpu, (size_t)FFN * 2 * HIDDEN);
+    slot->fc1_scales = h3_gpu_tensor_new_f32(dit->gpu, FFN * 2);
+    slot->fc2_int8 = h3_gpu_tensor_new_i8(dit->gpu, (size_t)HIDDEN * FFN);
+    slot->fc2_scales = h3_gpu_tensor_new_f32(dit->gpu, HIDDEN);
+    if (!slot->qkv_int8 || !slot->qkv_scales || !slot->out_int8 ||
+        !slot->out_scales || !slot->fc1_int8 || !slot->fc1_scales ||
+        !slot->fc2_int8 || !slot->fc2_scales) {
+        fail(error, error_size, "cannot allocate int8 SSD layer slot: %s",
+             h3_gpu_error(dit->gpu));
+        return 0;
+    }
     return 1;
 }
 
@@ -663,6 +711,37 @@ static h3_gpu_tensor *stream_slot_target(h3_dit_block *slot,
     if (field == STREAM_FC1) return slot->fc1;
     if (field == STREAM_FC2) return slot->fc2;
     return NULL;
+}
+
+static h3_gpu_tensor *stream_slot_int8(h3_dit_block *slot, unsigned field) {
+    if (field == STREAM_QKV) return slot->qkv_int8;
+    if (field == STREAM_OUT) return slot->out_int8;
+    if (field == STREAM_FC1) return slot->fc1_int8;
+    if (field == STREAM_FC2) return slot->fc2_int8;
+    return NULL;
+}
+
+static h3_gpu_tensor *stream_slot_scales(h3_dit_block *slot, unsigned field) {
+    if (field == STREAM_QKV) return slot->qkv_scales;
+    if (field == STREAM_OUT) return slot->out_scales;
+    if (field == STREAM_FC1) return slot->fc1_scales;
+    if (field == STREAM_FC2) return slot->fc2_scales;
+    return NULL;
+}
+
+/* int8 checkpoint: expand the slot's streamed int8 weights into its BF16
+ * tensors, so the block runs the same BF16 kernels as the BF16 stream. */
+static int expand_stream_slot(h3_dit *dit, unsigned layer, h3_dit_block *slot) {
+    const h3_dit_stream_layer *stream = &dit->stream_layers[layer];
+    for (unsigned index = 0; index < STREAM_MATRICES; index++) {
+        const h3_dit_stream_source *source = &stream->sources[index];
+        if (!h3_gpu_dequantize_weight_int8(
+                dit->gpu, stream_slot_target(slot, source->field),
+                stream_slot_int8(slot, source->field),
+                stream_slot_scales(slot, source->field), source->rows,
+                source->columns)) return 0;
+    }
+    return 1;
 }
 
 typedef struct {
@@ -684,6 +763,26 @@ static int read_stream_layer(h3_dit_stream_job *job) {
     job->error[0] = '\0';
     for (unsigned index = 0; index < STREAM_MATRICES; index++) {
         const h3_dit_stream_source *source = &layer->sources[index];
+        if (source->int8) {
+            h3_gpu_tensor *weights = stream_slot_int8(slot, source->field);
+            h3_gpu_tensor *scales = stream_slot_scales(slot, source->field);
+            if (!weights || !scales ||
+                !h3_gpu_tensor_stream_file(weights, source->path,
+                                           source->file_offset, job->error,
+                                           sizeof(job->error)) ||
+                !h3_gpu_tensor_stream_file(scales, source->scale_path,
+                                           source->scale_offset, job->error,
+                                           sizeof(job->error))) {
+                if (!job->error[0])
+                    snprintf(job->error, sizeof(job->error),
+                             "invalid int8 streaming destination");
+                job->ok = 0;
+                break;
+            }
+            job->bytes += h3_gpu_tensor_bytes(weights) +
+                          h3_gpu_tensor_bytes(scales);
+            continue;
+        }
         h3_gpu_tensor *target = stream_slot_target(slot, source->field);
         if (!target || !h3_gpu_tensor_stream_file_bf16(
                 target, source->path, source->file_offset, source->elements,
@@ -3037,6 +3136,9 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                 }
                 h3_dit_block *slot =
                     &dit->stream_slots[dit->stream_ready_slot];
+                if (dit->int8_stream)
+                    OP(expand_stream_slot(dit, block, slot),
+                       "expand int8 SSD DiT block");
                 streamed_weight = dit->blocks[block];
                 streamed_weight.qkv = slot->qkv;
                 streamed_weight.out = slot->out;
@@ -3858,9 +3960,9 @@ void h3_dit_free(h3_dit *dit) {
     if (dit->ssd_streaming && getenv("H3_PROFILE")) {
         double gib = (double)dit->stream_bytes / (1024.0 * 1024.0 * 1024.0);
         fprintf(stderr,
-                "h3: BF16 SSD stream %.3f GiB read in %.3fs (%.3f GiB/s), "
+                "h3: %s SSD stream %.3f GiB read in %.3fs (%.3f GiB/s), "
                 "unhidden wait %.3fs\n",
-                gib, dit->stream_read_seconds,
+                dit->int8_stream ? "int8" : "BF16", gib, dit->stream_read_seconds,
                 dit->stream_read_seconds > 0.0
                     ? gib / dit->stream_read_seconds : 0.0,
                 dit->stream_wait_seconds);
