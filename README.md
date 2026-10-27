@@ -675,6 +675,35 @@ On the clips tested, quality at 5-6 steps was comparable to the balanced preset,
 with sharper fine detail as the adapter's card advertises. An interactive
 session also amortizes transformer loading and text encoding across renders.
 
+### Turbo on an int8 checkpoint
+
+On a machine that only holds the int8 copy, `tools/fold_turbo_lora_int8.py`
+folds the adapter into it in place. Each I8 weight is expanded, the LoRA is
+added, and the result is rounded to BF16 and quantized again with
+`h3_int8_pack`'s arithmetic. BF16 targets are patched as above. Shards are
+cloned, patched and renamed over the originals, and `turbo_folded.json`
+records the finished ones, so an interrupted run resumes and a finished one is
+never folded twice. The base int8 weights are replaced; repack from BF16 to
+get them back.
+
+```sh
+python3 tools/fold_turbo_lora_int8.py \
+  --checkpoint ./MiniMax-H3-int8/FL2VA/transformer \
+  --lora ./minimax_h3_turbo_v4_step600_ema.safetensors
+```
+
+Folding after quantization rounds twice, so the weights are slightly further
+from the exact W + B·A than folding BF16 first and packing (on synthetic
+tensors, 0.9% against 0.65% relative RMS error). On a 16 GB M1 the fold took
+6 minutes with a 10.3 GB peak. Measured there with `--ssd-streaming`, 768x768,
+22 frames and the same prompt:
+
+| | base int8, 12 steps | Turbo int8, 6 steps |
+|---|---:|---:|
+| total | 65.7min | 32.0min |
+| denoise | 305s/step | 281s/step |
+| peak memory | 13.5 GB | 13.5 GB |
+
 ## Tests and runtime requirements
 
 ```sh
