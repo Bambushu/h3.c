@@ -37,8 +37,9 @@ static void usage(const char *program) {
         "      --core-reuse N     Core refresh: 1 exact (default), 4 fast, 6 aggressive\n"
         "      --token-reduction  Pair video tokens in middle DiT blocks\n"
         "      --ssd-streaming    Stream original BF16 DiT layers from SSD\n"
-        "      --lora PATH        Apply a DiT LoRA at load, e.g. the Turbo adapter (5-6 steps)\n"
-        "      --lora-scale F     LoRA strength (default 1)\n"
+        "      --lora PATH        Apply a DiT LoRA at load, e.g. the Turbo adapter (5-6 steps);\n"
+        "                         repeat to stack up to 4 (deltas summed in order)\n"
+        "      --lora-scale F     Strength of the preceding --lora (default 1)\n"
         "      --use-int8-row-fc2 Faster one-scale int8 FC2 (M5)\n"
         "      --use-reference-rope  Disable native 256 RoPE adaptation\n"
         "      --use-slower-bf16-mlp  Force close-reference BF16/MPS MLP\n"
@@ -423,16 +424,31 @@ int main(int argc, char **argv) {
                 break;
             case OPT_TOKEN_REDUCTION: params.token_reduction = 1; break;
             case OPT_SSD_STREAMING: params.ssd_streaming = 1; break;
-            case OPT_LORA: params.lora_path = optarg; break;
+            case OPT_LORA:
+                if (!params.lora_path) {
+                    params.lora_path = optarg;
+                } else if (params.lora_extra_count < H3_MAX_EXTRA_LORAS) {
+                    params.lora_extra_paths[params.lora_extra_count] = optarg;
+                    params.lora_extra_scales[params.lora_extra_count++] = 1.0;
+                } else {
+                    fprintf(stderr, "h3: at most %d --lora\n",
+                            H3_MAX_EXTRA_LORAS + 1);
+                    return 2;
+                }
+                break;
             case OPT_LORA_SCALE: {
                 char *end = NULL;
                 errno = 0;
-                params.lora_scale = strtod(optarg, &end);
+                double scale = strtod(optarg, &end);
                 if (errno || !end || end == optarg || *end ||
-                    !isfinite(params.lora_scale) || params.lora_scale == 0.0) {
+                    !isfinite(scale) || scale == 0.0) {
                     fprintf(stderr, "h3: invalid lora scale: %s\n", optarg);
                     return 2;
                 }
+                if (params.lora_extra_count)
+                    params.lora_extra_scales[params.lora_extra_count - 1] = scale;
+                else
+                    params.lora_scale = scale;
                 break;
             }
             case OPT_SDPA_QUERY_BLOCK: {

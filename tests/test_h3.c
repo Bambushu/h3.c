@@ -715,8 +715,10 @@ static uint16_t bf16_bits(float value) {
 static void test_lora(void) {
     char root[] = "/tmp/h3_lora_XXXXXX";
     CHECK(mkdtemp(root) != NULL);
-    char checkpoint[256], shard[320], adapter[320], mismatched[320];
+    char checkpoint[256], shard[320], adapter[320], mismatched[320],
+        comfy[320];
     snprintf(checkpoint, sizeof(checkpoint), "%s/transformer", root);
+    snprintf(comfy, sizeof(comfy), "%s/comfy.safetensors", root);
     snprintf(shard, sizeof(shard), "%s/model-00001.safetensors", checkpoint);
     snprintf(adapter, sizeof(adapter), "%s/adapter.safetensors", root);
     snprintf(mismatched, sizeof(mismatched), "%s/mismatched.safetensors",
@@ -787,11 +789,43 @@ static void test_lora(void) {
                                      sizeof(error)));
     CHECK(strstr(error, "blk.weight") != NULL);
 
+    /* A stack sums its scaled deltas in F32 and rounds once: 0.5 + 0.5 of one
+     * adapter is bit-identical to 1.0 of it. A ComfyUI copy of the adapter
+     * (diffusion_model. prefix) targets the same checkpoint key. */
+    const test_tensor comfy_tensors[] = {
+        {"diffusion_model.blk.lora_A.weight", "F32", 2, 4, a},
+        {"diffusion_model.blk.lora_B.weight", "BF16", 3, 2, b_bits},
+    };
+    write_safetensors(comfy, comfy_tensors, 2);
+    h3_lora *stack = h3_lora_open(adapter, 0.5f, error, sizeof(error));
+    CHECK(stack && h3_lora_add(stack, comfy, 0.5f, error, sizeof(error)));
+    CHECK(h3_lora_pairs(stack) == 2);
+    CHECK(h3_lora_key(stack) != h3_lora_key(lora) &&
+          h3_lora_key(stack) != h3_lora_key(stronger));
+    CHECK(!h3_lora_add(stack, comfy, 0.0f, error, sizeof(error)));
+    CHECK(h3_lora_pairs(stack) == 2);
+    uint16_t stacked[12], single[12];
+    memcpy(stacked, w_bits, sizeof(stacked));
+    memcpy(single, w_bits, sizeof(single));
+    CHECK(h3_lora_apply(stack, "blk.weight", stacked, 3, 4, error,
+                        sizeof(error)) == 1);
+    CHECK(h3_lora_apply(stronger, "blk.weight", single, 3, 4, error,
+                        sizeof(error)) == 1);
+    CHECK(memcmp(stacked, single, sizeof(stacked)) == 0);
+    store = h3_weight_store_open_lora(checkpoint, stack, error, sizeof(error));
+    CHECK(store != NULL);
+    h3_weight_store_free(store);
+    CHECK(h3_lora_add(stack, mismatched, 1.0f, error, sizeof(error)));
+    CHECK(!h3_weight_store_open_lora(checkpoint, stack, error,
+                                     sizeof(error)));
+    h3_lora_free(stack);
+
     h3_lora_free(wrong);
     h3_lora_free(stronger);
     h3_lora_free(same);
     h3_lora_free(lora);
-    CHECK(unlink(mismatched) == 0 && unlink(adapter) == 0 &&
+    CHECK(unlink(comfy) == 0 &&
+          unlink(mismatched) == 0 && unlink(adapter) == 0 &&
           unlink(shard) == 0 && rmdir(checkpoint) == 0 && rmdir(root) == 0);
 }
 

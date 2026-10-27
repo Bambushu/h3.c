@@ -611,6 +611,19 @@ the base and the adapted int8 caches sit side by side in
 map either one. A LoRA cannot be combined with `--ssd-streaming`, which streams
 unmodified checkpoint bytes.
 
+Style LoRAs stack: repeat `--lora` (up to 4), each followed by its own
+`--lora-scale`. The scaled deltas sum in F32 and the weight rounds to BF16
+once, so a single adapter is unchanged (same weights, same cache key) and a
+stack gets its own cache keyed on every file and scale in order. ComfyUI-format
+adapters, whose keys carry a `diffusion_model.` prefix (the Civitai H3 LoRAs),
+load as they are:
+
+```sh
+./h3 -d ./MiniMax-H3 -p "$(cat shot.txt)" --seconds 5 --steps 14 \
+  --lora nafasp_lora_v1_500.safetensors --lora-scale 0.8 \
+  --lora h3-realism-people-t2v-i2v-r2v.safetensors --lora-scale 0.5
+```
+
 Sample with `--steps 5` or `--steps 6` and no other speed flags. The distilled
 schedule removes the redundancy used by `--reuse` and `--core-reuse`, so neither
 option should be combined with it. On fast action, 4 steps showed motion smear;

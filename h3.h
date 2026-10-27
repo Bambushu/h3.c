@@ -16,6 +16,7 @@ extern "C" {
 #define H3_DEFAULT_STEPS 20
 #define H3_DEFAULT_DIT_LAYERS 50
 #define H3_MIN_DIT_LAYERS 35
+#define H3_MAX_EXTRA_LORAS 3
 #define H3_REFERENCE_AUDIO_RATE 32000
 #define H3_REFERENCE_AUDIO_MAX_SECONDS 45
 #define H3_REFERENCE_AUDIO_MAX_SAMPLES \
@@ -172,13 +173,19 @@ typedef struct {
      * is built once beside the base one. Not with ssd_streaming. */
     const char *lora_path;
     double lora_scale;
+    /* Further LoRAs stacked on lora_path in order; their scaled deltas sum
+     * in F32 with lora_path's before the one BF16 round. */
+    const char *lora_extra_paths[H3_MAX_EXTRA_LORAS];
+    double lora_extra_scales[H3_MAX_EXTRA_LORAS];
+    int lora_extra_count;
 } h3_params;
 
 #define H3_PARAMS_DEFAULT { \
     H3_DEFAULT_WIDTH, H3_DEFAULT_HEIGHT, H3_DEFAULT_FRAMES, H3_DEFAULT_STEPS, \
     UINT64_C(42), NULL, NULL, NULL, NULL, 0, H3_REFERENCE_IMAGE_MATCH, \
     1, H3_DEFAULT_DIT_LAYERS, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NULL, NULL, NULL, \
-    H3_SAMPLER_EULER, H3_SCHEDULER_LINEAR, 0.0, NULL, NULL, NULL, 1.0 \
+    H3_SAMPLER_EULER, H3_SCHEDULER_LINEAR, 0.0, NULL, NULL, NULL, 1.0, \
+    {NULL}, {0.0}, 0 \
 }
 
 typedef struct {

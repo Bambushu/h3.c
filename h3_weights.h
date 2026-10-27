@@ -20,9 +20,14 @@ typedef struct h3_lora h3_lora;
 
 h3_lora *h3_lora_open(const char *path, float scale,
                       char *error, size_t error_size);
+/* Stack another adapter: its scaled delta sums with the others in F32 before
+ * the one BF16 round. ComfyUI's diffusion_model. key prefix is stripped. */
+int h3_lora_add(h3_lora *lora, const char *path, float scale,
+                char *error, size_t error_size);
 void h3_lora_free(h3_lora *lora);
 size_t h3_lora_pairs(const h3_lora *lora);
-/* Hash of the adapter file's bytes and the scale, for derived-weight caches. */
+/* Hash of the adapter files' bytes and scales in order, for derived-weight
+ * caches; a single adapter keeps its own key. */
 uint64_t h3_lora_key(const h3_lora *lora);
 /* Add the adapter's delta to a row-major BF16 [rows, columns] weight in
  * place. Returns 1 if name is a target, 0 if not, -1 on error. */

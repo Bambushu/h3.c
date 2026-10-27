@@ -20,11 +20,20 @@ typedef struct {
     const h3_st_tensor *b;  /* [rows, rank] */
 } h3_lora_pair;
 
-struct h3_lora {
+typedef struct {
     h3_st_header header;
     h3_lora_pair *pairs;
     size_t count;
     float scale;
+    uint64_t key;
+} h3_lora_adapter;
+
+/* A stack of adapters; one adapter keeps its own key, so a single-LoRA int8
+ * cache stays valid. */
+struct h3_lora {
+    h3_lora_adapter *adapters;
+    size_t count;
+    size_t pairs;
     uint64_t key;
 };
 
@@ -48,11 +57,18 @@ static int compare_pairs(const void *left, const void *right) {
     return strcmp(a->target, b->target);
 }
 
-static const h3_lora_pair *find_pair(const h3_lora *lora, const char *name) {
-    if (!lora || !name) return NULL;
+static const h3_lora_pair *adapter_pair(const h3_lora_adapter *adapter,
+                                        const char *name) {
     h3_lora_pair probe = {(char *)name, NULL, NULL};
-    return bsearch(&probe, lora->pairs, lora->count, sizeof(*lora->pairs),
-                   compare_pairs);
+    return bsearch(&probe, adapter->pairs, adapter->count,
+                   sizeof(*adapter->pairs), compare_pairs);
+}
+
+static int find_pair(const h3_lora *lora, const char *name) {
+    if (!lora || !name) return 0;
+    for (size_t index = 0; index < lora->count; index++)
+        if (adapter_pair(&lora->adapters[index], name)) return 1;
+    return 0;
 }
 
 static int lora_factor(const h3_st_tensor *tensor) {
@@ -93,23 +109,33 @@ static int hash_file_words(const char *path, uint64_t *hash,
     return 1;
 }
 
-h3_lora *h3_lora_open(const char *path, float scale,
-                      char *error, size_t error_size) {
+static void adapter_free(h3_lora_adapter *adapter) {
+    for (size_t index = 0; index < adapter->count; index++)
+        free(adapter->pairs[index].target);
+    free(adapter->pairs);
+    h3_st_free_header(&adapter->header);
+}
+
+/* ComfyUI-format adapters name targets diffusion_model.<key>; the checkpoint
+ * keys have no prefix. */
+static const char *strip_prefix(const char *name) {
+    static const char prefix[] = "diffusion_model.";
+    return strncmp(name, prefix, sizeof(prefix) - 1) ? name
+                                                     : name + sizeof(prefix) - 1;
+}
+
+static int adapter_open(h3_lora_adapter *lora, const char *path, float scale,
+                        char *error, size_t error_size) {
+    memset(lora, 0, sizeof(*lora));
     if (!path || !*path || !isfinite(scale) || scale == 0.0f) {
         fail(error, error_size, "LoRA needs a path and a finite nonzero scale");
-        return NULL;
-    }
-    h3_lora *lora = calloc(1, sizeof(*lora));
-    if (!lora) {
-        fail(error, error_size, "out of memory opening LoRA");
-        return NULL;
+        return 0;
     }
     lora->scale = scale;
     char detail[384];
     if (!h3_st_read_header(path, &lora->header, detail, sizeof(detail))) {
         fail(error, error_size, "%s", detail);
-        free(lora);
-        return NULL;
+        return 0;
     }
     static const char suffix_a[] = ".lora_A.weight";
     static const char suffix_b[] = ".lora_B.weight";
@@ -133,45 +159,89 @@ h3_lora *h3_lora_open(const char *path, float scale,
             fail(error, error_size, "LoRA %s: %s has no matching %s pair",
                  path, a->name, b ? "rank" : suffix_b + 1);
             free(name);
-            h3_lora_free(lora);
-            return NULL;
+            adapter_free(lora);
+            return 0;
         }
         memcpy(name + stem, ".weight", sizeof(".weight"));
+        const char *target = strip_prefix(name);
+        if (target != name) memmove(name, target, strlen(target) + 1);
         lora->pairs[lora->count++] = (h3_lora_pair){name, a, b};
     }
     if (!lora->count) {
         fail(error, error_size, "LoRA %s has no .lora_A/.lora_B pairs", path);
-        h3_lora_free(lora);
-        return NULL;
+        adapter_free(lora);
+        return 0;
     }
     qsort(lora->pairs, lora->count, sizeof(*lora->pairs), compare_pairs);
+    for (size_t index = 1; index < lora->count; index++) {
+        if (!strcmp(lora->pairs[index - 1].target, lora->pairs[index].target)) {
+            fail(error, error_size, "LoRA %s targets %s twice", path,
+                 lora->pairs[index].target);
+            adapter_free(lora);
+            return 0;
+        }
+    }
     uint64_t hash;
     if (!hash_file_words(path, &hash, error, error_size)) {
-        h3_lora_free(lora);
-        return NULL;
+        adapter_free(lora);
+        return 0;
     }
     uint32_t bits;
     memcpy(&bits, &scale, sizeof(bits));
     lora->key = (hash ^ bits) * UINT64_C(1099511628211);
-    return lora;
+    return 1;
 
 out_of_memory:
     fail(error, error_size, "out of memory opening LoRA");
-    h3_lora_free(lora);
-    return NULL;
+    adapter_free(lora);
+    return 0;
+}
+
+h3_lora *h3_lora_open(const char *path, float scale,
+                      char *error, size_t error_size) {
+    h3_lora *lora = calloc(1, sizeof(*lora));
+    if (!lora) {
+        fail(error, error_size, "out of memory opening LoRA");
+        return NULL;
+    }
+    if (!h3_lora_add(lora, path, scale, error, error_size)) {
+        free(lora);
+        return NULL;
+    }
+    return lora;
+}
+
+int h3_lora_add(h3_lora *lora, const char *path, float scale,
+                char *error, size_t error_size) {
+    if (!lora) return 0;
+    h3_lora_adapter adapter;
+    if (!adapter_open(&adapter, path, scale, error, error_size)) return 0;
+    h3_lora_adapter *grown = realloc(lora->adapters,
+                                     (lora->count + 1) * sizeof(*grown));
+    if (!grown) {
+        fail(error, error_size, "out of memory opening LoRA");
+        adapter_free(&adapter);
+        return 0;
+    }
+    lora->adapters = grown;
+    lora->adapters[lora->count++] = adapter;
+    lora->pairs += adapter.count;
+    /* Order matters (the deltas sum in order), so the key does too. */
+    lora->key = lora->count == 1 ? adapter.key
+        : (lora->key ^ adapter.key) * UINT64_C(1099511628211);
+    return 1;
 }
 
 void h3_lora_free(h3_lora *lora) {
     if (!lora) return;
     for (size_t index = 0; index < lora->count; index++)
-        free(lora->pairs[index].target);
-    free(lora->pairs);
-    h3_st_free_header(&lora->header);
+        adapter_free(&lora->adapters[index]);
+    free(lora->adapters);
     free(lora);
 }
 
 size_t h3_lora_pairs(const h3_lora *lora) {
-    return lora ? lora->count : 0;
+    return lora ? lora->pairs : 0;
 }
 
 uint64_t h3_lora_key(const h3_lora *lora) {
@@ -192,7 +262,7 @@ static uint16_t bf16_round(float value) {
     return (uint16_t)((bits + 0x7FFFu + ((bits >> 16) & 1u)) >> 16);
 }
 
-static float *read_factor(const h3_lora *lora, const h3_st_tensor *tensor,
+static float *read_factor(const h3_lora_adapter *lora, const h3_st_tensor *tensor,
                           char *error, size_t error_size) {
     uint64_t elements = h3_st_tensor_elements(tensor);
     size_t item = h3_dtype_size(tensor->dtype);
@@ -218,39 +288,58 @@ static float *read_factor(const h3_lora *lora, const h3_st_tensor *tensor,
 int h3_lora_apply(const h3_lora *lora, const char *name, uint16_t *values,
                   uint64_t rows, uint64_t columns,
                   char *error, size_t error_size) {
-    const h3_lora_pair *pair = find_pair(lora, name);
-    if (!pair) return 0;
-    uint64_t rank = pair->a->shape[0];
-    if (!values || pair->b->shape[0] != rows || pair->a->shape[1] != columns ||
-        rows > SIZE_MAX / columns ||
+    if (!find_pair(lora, name)) return 0;
+    if (!values || rows > SIZE_MAX / columns ||
         rows * columns > SIZE_MAX / sizeof(float)) {
         fail(error, error_size, "LoRA target %s has the wrong shape", name);
         return -1;
     }
     size_t elements = (size_t)(rows * columns);
-    float *a = read_factor(lora, pair->a, error, error_size);
-    float *b = a ? read_factor(lora, pair->b, error, error_size) : NULL;
-    float *delta = b ? malloc(elements * sizeof(float)) : NULL;
+    float *sum = calloc(elements, sizeof(float));
+    float *delta = sum ? malloc(elements * sizeof(float)) : NULL;
     if (!delta) {
-        if (b) fail(error, error_size, "out of memory adapting %s", name);
-        free(a);
-        free(b);
+        fail(error, error_size, "out of memory adapting %s", name);
+        free(sum);
         return -1;
     }
-    /* One full-matrix SGEMM, as numpy's B @ A, so the F32 delta and hence
-     * the rounded BF16 weight match the offline fold bit for bit. */
-    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                (__LAPACK_int)rows, (__LAPACK_int)columns, (__LAPACK_int)rank,
-                1.0f, b, (__LAPACK_int)rank, a, (__LAPACK_int)columns,
-                0.0f, delta, (__LAPACK_int)columns);
-    float scale = lora->scale;
+    for (size_t at = 0; at < lora->count; at++) {
+        const h3_lora_adapter *adapter = &lora->adapters[at];
+        const h3_lora_pair *pair = adapter_pair(adapter, name);
+        if (!pair) continue;
+        uint64_t rank = pair->a->shape[0];
+        if (pair->b->shape[0] != rows || pair->a->shape[1] != columns) {
+            fail(error, error_size, "LoRA target %s has the wrong shape", name);
+            free(sum);
+            free(delta);
+            return -1;
+        }
+        float *a = read_factor(adapter, pair->a, error, error_size);
+        float *b = a ? read_factor(adapter, pair->b, error, error_size) : NULL;
+        if (!b) {
+            free(a);
+            free(sum);
+            free(delta);
+            return -1;
+        }
+        /* One full-matrix SGEMM, as numpy's B @ A, so the F32 delta and hence
+         * the rounded BF16 weight match the offline fold bit for bit. */
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                    (__LAPACK_int)rows, (__LAPACK_int)columns, (__LAPACK_int)rank,
+                    1.0f, b, (__LAPACK_int)rank, a, (__LAPACK_int)columns,
+                    0.0f, delta, (__LAPACK_int)columns);
+        float scale = adapter->scale;
+        for (size_t index = 0; index < elements; index++)
+            sum[index] += scale * delta[index];
+        free(a);
+        free(b);
+    }
+    /* Every delta sums in F32 and the weight rounds to BF16 once; with one
+     * adapter 0 + scale * delta is exact, the single-LoRA result. */
     for (size_t index = 0; index < elements; index++) {
-        float scaled = scale * delta[index];
-        float adapted = bf16_value(values[index]) + scaled;
+        float adapted = bf16_value(values[index]) + sum[index];
         values[index] = bf16_round(adapted);
     }
-    free(a);
-    free(b);
+    free(sum);
     free(delta);
     return 1;
 }
@@ -354,8 +443,9 @@ h3_weight_store *h3_weight_store_open_lora(const char *directory,
                                            char *error, size_t error_size) {
     h3_weight_store *store = h3_weight_store_open(directory, error, error_size);
     if (!store || !lora) return store;
-    for (size_t index = 0; index < lora->count; index++) {
-        const h3_lora_pair *pair = &lora->pairs[index];
+    for (size_t at = 0; at < lora->count; at++)
+    for (size_t index = 0; index < lora->adapters[at].count; index++) {
+        const h3_lora_pair *pair = &lora->adapters[at].pairs[index];
         const h3_st_tensor *tensor = h3_weight_find(store, pair->target, NULL);
         if (!tensor || tensor->dtype != H3_DTYPE_BF16 || tensor->ndim != 2 ||
             tensor->shape[0] != pair->b->shape[0] ||

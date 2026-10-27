@@ -613,6 +613,21 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
         h3_set_error(ctx, "a LoRA needs a path and a finite nonzero scale");
         return 0;
     }
+    if (params->lora_extra_count < 0 ||
+        params->lora_extra_count > H3_MAX_EXTRA_LORAS ||
+        (params->lora_extra_count && !params->lora_path)) {
+        h3_set_error(ctx, "stacked LoRAs need a first lora_path and at most "
+                         "%d more", H3_MAX_EXTRA_LORAS);
+        return 0;
+    }
+    for (int index = 0; index < params->lora_extra_count; index++) {
+        const char *path = params->lora_extra_paths[index];
+        double scale = params->lora_extra_scales[index];
+        if (!path || !*path || !isfinite(scale) || scale == 0.0) {
+            h3_set_error(ctx, "a LoRA needs a path and a finite nonzero scale");
+            return 0;
+        }
+    }
     if (params->lora_path && params->ssd_streaming) {
         h3_set_error(ctx, "SSD streaming reads original BF16 weights and "
                          "cannot be combined with a LoRA");
@@ -1164,6 +1179,19 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         }
         fprintf(stderr, "h3: LoRA %s: %zu tensors, scale %g\n",
                 params->lora_path, h3_lora_pairs(lora), params->lora_scale);
+        for (int index = 0; index < params->lora_extra_count; index++) {
+            size_t before = h3_lora_pairs(lora);
+            if (!h3_lora_add(lora, params->lora_extra_paths[index],
+                             (float)params->lora_extra_scales[index],
+                             lora_error, sizeof(lora_error))) {
+                h3_set_error(ctx, "%s", lora_error);
+                goto cleanup;
+            }
+            fprintf(stderr, "h3: LoRA %s: %zu tensors, scale %g (stacked)\n",
+                    params->lora_extra_paths[index],
+                    h3_lora_pairs(lora) - before,
+                    params->lora_extra_scales[index]);
+        }
     }
     prepared_key = h3_prepared_key(
         conditioning_key, params, render_width, render_height,
