@@ -1641,6 +1641,27 @@ static H3SDPA *h3_gpu_sdpa_graph(H3GPU *gpu, uint32_t batch,
             h3_gpu_set_error(gpu, @"native MPSGraph SDPA is unavailable");
             return nil;
         }
+        /* Before Apple9 (M1/M2), MPS cannot build its SDPA tile kernel for
+         * the vision encoder's 72-wide heads ("exceeds available stack
+         * space"). Zero-padding Q/K/V to a multiple of 64 leaves every dot
+         * product, and so the result, unchanged; the output is sliced back. */
+        uint32_t padded_dim = head_dim;
+        if (head_dim % 64u &&
+            ![gpu.device supportsFamily:MTLGPUFamilyApple9]) {
+            padded_dim = (head_dim + 63u) & ~63u;
+            NSArray<NSNumber *> *left = @[@0, @0, @0, @0];
+            NSArray<NSNumber *> *right =
+                @[@0, @0, @0, @(padded_dim - head_dim)];
+            qt = [graph padTensor:qt withPaddingMode:MPSGraphPaddingModeConstant
+                      leftPadding:left rightPadding:right constantValue:0.0
+                             name:nil];
+            kt = [graph padTensor:kt withPaddingMode:MPSGraphPaddingModeConstant
+                      leftPadding:left rightPadding:right constantValue:0.0
+                             name:nil];
+            vt = [graph padTensor:vt withPaddingMode:MPSGraphPaddingModeConstant
+                      leftPadding:left rightPadding:right constantValue:0.0
+                             name:nil];
+        }
         MPSGraphTensor *attention;
         if (causal) {
             size_t mask_count = (size_t)sequence * sequence;
@@ -1682,6 +1703,9 @@ static H3SDPA *h3_gpu_sdpa_graph(H3GPU *gpu, uint32_t batch,
             attention = [graph scaledDotProductAttentionWithQueryTensor:qt
                 keyTensor:kt valueTensor:vt scale:scale name:nil];
         }
+        if (padded_dim != head_dim)
+            attention = [graph sliceTensor:attention dimension:3 start:0
+                                    length:head_dim name:nil];
         H3SDPA *result = [[H3SDPA alloc] init];
         result.graph = graph;
         result.query = q;
